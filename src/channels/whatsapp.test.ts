@@ -3,6 +3,13 @@ import { EventEmitter } from 'events';
 
 // --- Mocks ---
 
+// Mock image processing (tests verify caption passthrough, not image processing)
+vi.mock('../image.js', () => ({
+  isImageMessage: vi.fn(() => false),
+  processImage: vi.fn(() => Promise.resolve(null)),
+  parseImageReferences: vi.fn(() => []),
+}));
+
 // Mock config
 vi.mock('../config.js', () => ({
   STORE_DIR: '/tmp/nanoclaw-test-store',
@@ -87,9 +94,7 @@ vi.mock('@whiskeysockets/baileys', () => {
       timedOut: 408,
       restartRequired: 515,
     },
-    downloadMediaMessage: vi
-      .fn()
-      .mockResolvedValue(Buffer.from('pdf-data')),
+    downloadMediaMessage: vi.fn().mockResolvedValue(Buffer.from('pdf-data')),
     fetchLatestWaWebVersion: vi
       .fn()
       .mockResolvedValue({ version: [2, 3000, 0] }),
