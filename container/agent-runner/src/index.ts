@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { execFile } from 'child_process';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
@@ -28,7 +29,7 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   imageAttachments?: Array<{ relativePath: string; mediaType: string }>;
-
+  script?: string;
 }
 
 interface ImageContentBlock {
@@ -513,6 +514,55 @@ async function runQuery(
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
 
+interface ScriptResult {
+  wakeAgent: boolean;
+  data?: unknown;
+}
+
+const SCRIPT_TIMEOUT_MS = 30_000;
+
+async function runScript(script: string): Promise<ScriptResult | null> {
+  const scriptPath = '/tmp/task-script.sh';
+  fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+
+  return new Promise((resolve) => {
+    execFile('bash', [scriptPath], {
+      timeout: SCRIPT_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+      env: process.env,
+    }, (error, stdout, stderr) => {
+      if (stderr) {
+        log(`Script stderr: ${stderr.slice(0, 500)}`);
+      }
+
+      if (error) {
+        log(`Script error: ${error.message}`);
+        return resolve(null);
+      }
+
+      // Parse last non-empty line of stdout as JSON
+      const lines = stdout.trim().split('\n');
+      const lastLine = lines[lines.length - 1];
+      if (!lastLine) {
+        log('Script produced no output');
+        return resolve(null);
+      }
+
+      try {
+        const result = JSON.parse(lastLine);
+        if (typeof result.wakeAgent !== 'boolean') {
+          log(`Script output missing wakeAgent boolean: ${lastLine.slice(0, 200)}`);
+          return resolve(null);
+        }
+        resolve(result as ScriptResult);
+      } catch {
+        log(`Script output is not valid JSON: ${lastLine.slice(0, 200)}`);
+        resolve(null);
+      }
+    });
+  });
+}
+
 async function main(): Promise<void> {
   let containerInput: ContainerInput;
 
@@ -552,6 +602,126 @@ async function main(): Promise<void> {
   if (pending.length > 0) {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
     prompt += '\n' + pending.join('\n');
+  }
+
+  // --- Slash command handling ---
+  // Only known session slash commands are handled here. This prevents
+  // accidental interception of user prompts that happen to start with '/'.
+  const KNOWN_SESSION_COMMANDS = new Set(['/compact']);
+  const trimmedPrompt = prompt.trim();
+  const isSessionSlashCommand = KNOWN_SESSION_COMMANDS.has(trimmedPrompt);
+
+  if (isSessionSlashCommand) {
+    log(`Handling session command: ${trimmedPrompt}`);
+    let slashSessionId: string | undefined;
+    let compactBoundarySeen = false;
+    let hadError = false;
+    let resultEmitted = false;
+
+    try {
+      for await (const message of query({
+        prompt: trimmedPrompt,
+        options: {
+          cwd: '/workspace/group',
+          resume: sessionId,
+          systemPrompt: undefined,
+          allowedTools: [],
+          env: sdkEnv,
+          permissionMode: 'bypassPermissions' as const,
+          allowDangerouslySkipPermissions: true,
+          settingSources: ['project', 'user'] as const,
+          hooks: {
+            PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
+          },
+        },
+      })) {
+        const msgType = message.type === 'system'
+          ? `system/${(message as { subtype?: string }).subtype}`
+          : message.type;
+        log(`[slash-cmd] type=${msgType}`);
+
+        if (message.type === 'system' && message.subtype === 'init') {
+          slashSessionId = message.session_id;
+          log(`Session after slash command: ${slashSessionId}`);
+        }
+
+        // Observe compact_boundary to confirm compaction completed
+        if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
+          compactBoundarySeen = true;
+          log('Compact boundary observed — compaction completed');
+        }
+
+        if (message.type === 'result') {
+          const resultSubtype = (message as { subtype?: string }).subtype;
+          const textResult = 'result' in message ? (message as { result?: string }).result : null;
+
+          if (resultSubtype?.startsWith('error')) {
+            hadError = true;
+            writeOutput({
+              status: 'error',
+              result: null,
+              error: textResult || 'Session command failed.',
+              newSessionId: slashSessionId,
+            });
+          } else {
+            writeOutput({
+              status: 'success',
+              result: textResult || 'Conversation compacted.',
+              newSessionId: slashSessionId,
+            });
+          }
+          resultEmitted = true;
+        }
+      }
+    } catch (err) {
+      hadError = true;
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      log(`Slash command error: ${errorMsg}`);
+      writeOutput({ status: 'error', result: null, error: errorMsg });
+    }
+
+    log(`Slash command done. compactBoundarySeen=${compactBoundarySeen}, hadError=${hadError}`);
+
+    // Warn if compact_boundary was never observed — compaction may not have occurred
+    if (!hadError && !compactBoundarySeen) {
+      log('WARNING: compact_boundary was not observed. Compaction may not have completed.');
+    }
+
+    // Only emit final session marker if no result was emitted yet and no error occurred
+    if (!resultEmitted && !hadError) {
+      writeOutput({
+        status: 'success',
+        result: compactBoundarySeen
+          ? 'Conversation compacted.'
+          : 'Compaction requested but compact_boundary was not observed.',
+        newSessionId: slashSessionId,
+      });
+    } else if (!hadError) {
+      // Emit session-only marker so host updates session tracking
+      writeOutput({ status: 'success', result: null, newSessionId: slashSessionId });
+    }
+    return;
+  }
+  // --- End slash command handling ---
+
+  // Script phase: run script before waking agent
+  if (containerInput.script && containerInput.isScheduledTask) {
+    log('Running task script...');
+    const scriptResult = await runScript(containerInput.script);
+
+    if (!scriptResult || !scriptResult.wakeAgent) {
+      const reason = scriptResult ? 'wakeAgent=false' : 'script error/no output';
+      log(`Script decided not to wake agent: ${reason}`);
+      writeOutput({
+        status: 'success',
+        result: null,
+      });
+      return;
+    }
+
+    // Script says wake agent — enrich prompt with script data
+    log(`Script wakeAgent=true, enriching prompt with data`);
+    prompt = `[SCHEDULED TASK]\n\nScript output:\n${JSON.stringify(scriptResult.data, null, 2)}\n\nInstructions:\n${containerInput.prompt}`;
   }
 
   // Query loop: run query → wait for IPC message → run new query → repeat
