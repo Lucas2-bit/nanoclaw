@@ -25,7 +25,12 @@ import {
 import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
+  PROXY_BIND_HOST,
 } from './container-runtime.js';
+import { startCredentialProxy } from './credential-proxy.js';
+import {
+  CREDENTIAL_PROXY_PORT,
+} from './config.js';
 import {
   getAllChats,
   getAllRegisteredGroups,
@@ -78,7 +83,6 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
-
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -613,9 +617,16 @@ async function main(): Promise<void> {
 
   restoreRemoteControl();
 
+  // Start credential proxy (containers route API calls through this)
+  const proxyServer = await startCredentialProxy(
+    CREDENTIAL_PROXY_PORT,
+    PROXY_BIND_HOST,
+  );
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    proxyServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
