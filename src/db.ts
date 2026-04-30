@@ -82,6 +82,23 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS dead_letter_queue (
+      id TEXT PRIMARY KEY,
+      group_folder TEXT,
+      chat_jid TEXT,
+      content TEXT,
+      failed_at TEXT,
+      retry_count INTEGER DEFAULT 0,
+      last_error TEXT,
+      resolved INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_dlq_resolved ON dead_letter_queue(resolved);
+
+    CREATE TABLE IF NOT EXISTS jid_links (
+      secondary_jid TEXT PRIMARY KEY,
+      primary_jid TEXT NOT NULL
+    );
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -386,6 +403,24 @@ export function getLastBotMessageTimestamp(
     )
     .get(chatJid, `${botPrefix}:%`) as { ts: string | null } | undefined;
   return row?.ts ?? undefined;
+}
+
+/**
+ * Check if there is already a pending /compact message for a given JID
+ * that was injected after the last bot response.
+ */
+export function hasPendingCompact(chatJid: string, botPrefix: string): boolean {
+  const lastBot = getLastBotMessageTimestamp(chatJid, botPrefix);
+  const sinceTs = lastBot ?? '';
+  const row = db
+    .prepare(
+      `SELECT 1 FROM messages
+       WHERE chat_jid = ? AND content = '/compact' AND is_from_me = 1
+         AND timestamp > ?
+       LIMIT 1`,
+    )
+    .get(chatJid, sinceTs) as Record<string, unknown> | undefined;
+  return row !== undefined;
 }
 
 export function createTask(
@@ -729,4 +764,114 @@ function migrateJsonState(): void {
       }
     }
   }
+}
+
+// --- Dead Letter Queue accessors ---
+
+export interface DeadLetterEntry {
+  id: string;
+  group_folder: string | null;
+  chat_jid: string | null;
+  content: string | null;
+  failed_at: string;
+  retry_count: number;
+  last_error: string | null;
+  /** 0 = pending retry, 1 = resolved (sent successfully), -1 = permanently failed */
+  resolved: number;
+}
+
+/**
+ * Insert a failed outbound message into the dead letter queue.
+ */
+export function insertDeadLetter(
+  entry: Omit<DeadLetterEntry, 'retry_count' | 'resolved'>,
+): void {
+  db.prepare(
+    `
+    INSERT OR IGNORE INTO dead_letter_queue (id, group_folder, chat_jid, content, failed_at, retry_count, last_error, resolved)
+    VALUES (?, ?, ?, ?, ?, 0, ?, 0)
+  `,
+  ).run(
+    entry.id,
+    entry.group_folder,
+    entry.chat_jid,
+    entry.content,
+    entry.failed_at,
+    entry.last_error,
+  );
+}
+
+/**
+ * Return all unresolved dead letter entries with retry_count < maxRetries,
+ * ordered oldest-first.
+ */
+export function getPendingDeadLetters(maxRetries: number): DeadLetterEntry[] {
+  return db
+    .prepare(
+      `
+    SELECT * FROM dead_letter_queue
+    WHERE resolved = 0 AND retry_count < ?
+    ORDER BY failed_at
+  `,
+    )
+    .all(maxRetries) as DeadLetterEntry[];
+}
+
+/**
+ * Increment the retry count and update the last error for a dead letter entry.
+ */
+export function updateDeadLetterRetry(id: string, lastError: string): void {
+  db.prepare(
+    `
+    UPDATE dead_letter_queue SET retry_count = retry_count + 1, last_error = ? WHERE id = ?
+  `,
+  ).run(lastError, id);
+}
+
+/**
+ * Mark a dead letter entry as resolved.
+ * Pass resolved = 1 for success, -1 for permanent failure.
+ */
+export function resolveDeadLetter(id: string, resolved: 1 | -1): void {
+  db.prepare(`UPDATE dead_letter_queue SET resolved = ? WHERE id = ?`).run(
+    resolved,
+    id,
+  );
+}
+
+/**
+ * Return all dead letter queue entries (for health reporting / Ulterior).
+ */
+export function getDeadLetterQueue(): DeadLetterEntry[] {
+  return db
+    .prepare(`SELECT * FROM dead_letter_queue ORDER BY failed_at DESC`)
+    .all() as DeadLetterEntry[];
+}
+
+// --- JID Linking (channel unification) ---
+
+export function linkJid(secondaryJid: string, primaryJid: string): void {
+  db.prepare(
+    'INSERT OR REPLACE INTO jid_links (secondary_jid, primary_jid) VALUES (?, ?)',
+  ).run(secondaryJid, primaryJid);
+}
+
+export function unlinkJid(secondaryJid: string): void {
+  db.prepare('DELETE FROM jid_links WHERE secondary_jid = ?').run(secondaryJid);
+}
+
+export function getAllJidLinks(): Array<{
+  secondary_jid: string;
+  primary_jid: string;
+}> {
+  return db
+    .prepare('SELECT secondary_jid, primary_jid FROM jid_links')
+    .all() as Array<{ secondary_jid: string; primary_jid: string }>;
+}
+
+export function getLinkedJids(primaryJid: string): string[] {
+  const rows = db
+    .prepare('SELECT secondary_jid FROM jid_links WHERE primary_jid = ?')
+    .all(primaryJid) as Array<{ secondary_jid: string }>;
+  return rows.map((r) => r.secondary_jid);
 }

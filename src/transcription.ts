@@ -19,7 +19,7 @@ const WHISPER_MODEL =
 
 const FALLBACK_MESSAGE = '[Voice Message - transcription unavailable]';
 
-async function transcribeWithWhisperCpp(
+export async function transcribeWithWhisperCpp(
   audioBuffer: Buffer,
 ): Promise<string | null> {
   const tmpDir = os.tmpdir();

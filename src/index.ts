@@ -27,12 +27,12 @@ import {
   ensureContainerRuntimeRunning,
   PROXY_BIND_HOST,
 } from './container-runtime.js';
+import { startClaudeTaskServer } from './claude-task-server.js';
 import { startCredentialProxy } from './credential-proxy.js';
-import {
-  CREDENTIAL_PROXY_PORT,
-} from './config.js';
+import { CLAUDE_TASK_PORT, CREDENTIAL_PROXY_PORT } from './config.js';
 import {
   getAllChats,
+  getAllJidLinks,
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
@@ -40,16 +40,22 @@ import {
   getMessagesSince,
   getNewMessages,
   getRouterState,
+  hasPendingCompact,
   initDatabase,
+  linkJid,
   setRegisteredGroup,
   setRouterState,
   setSession,
   storeChatMetadata,
   storeMessage,
+  storeMessageDirect,
+  unlinkJid,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
+import { startPactBridge } from './pact-bridge.js';
+import { initFormationHandler } from './formation-handler.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
   restoreRemoteControl,
@@ -67,13 +73,22 @@ import {
   handleSessionCommand,
   isSessionCommandAllowed,
 } from './session-commands.js';
+import { startChannelHealthMonitor } from './channel-health.js';
+import {
+  recordSendFailure,
+  startDeadLetterWorker,
+} from './dead-letter-worker.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import { getSessionFileSize, startSessionMonitor } from './session-monitor.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { parseImageReferences } from './image.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
+
+// Export JID linking for IPC use
+export { handleLinkJid, handleUnlinkJid };
 
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
@@ -83,6 +98,74 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+// --- JID linking cache (channel unification) ---
+// Maps secondary JID -> primary JID. Loaded at startup, invalidated on link/unlink.
+let jidLinksCache: Map<string, string> = new Map();
+
+function loadJidLinks(): void {
+  jidLinksCache = new Map();
+  for (const link of getAllJidLinks()) {
+    jidLinksCache.set(link.secondary_jid, link.primary_jid);
+  }
+  if (jidLinksCache.size > 0) {
+    logger.info({ linkCount: jidLinksCache.size }, 'JID links loaded');
+  }
+}
+
+/**
+ * Resolve a JID to its primary JID if linked, otherwise return the JID itself.
+ */
+function resolvePrimaryJid(jid: string): string {
+  const primary = jidLinksCache.get(jid);
+  if (primary) {
+    logger.debug(
+      { originalJid: jid, resolvedJid: primary },
+      'JID resolved via link',
+    );
+    return primary;
+  }
+  return jid;
+}
+
+/**
+ * Get all secondary JIDs that are linked to a given primary JID.
+ */
+function getSecondaryJids(primaryJid: string): string[] {
+  const secondaries: string[] = [];
+  for (const [secondary, primary] of jidLinksCache) {
+    if (primary === primaryJid) secondaries.push(secondary);
+  }
+  return secondaries;
+}
+
+/**
+ * Get all JIDs that should be polled: registered JIDs + linked secondary JIDs.
+ */
+function getAllPollableJids(): string[] {
+  const registered = Object.keys(registeredGroups);
+  const linked = [...jidLinksCache.keys()];
+  return [...new Set([...registered, ...linked])];
+}
+
+/**
+ * Link a secondary JID to a primary JID (channel unification).
+ * Persists to DB and updates in-memory cache.
+ */
+function handleLinkJid(secondaryJid: string, primaryJid: string): void {
+  linkJid(secondaryJid, primaryJid);
+  jidLinksCache.set(secondaryJid, primaryJid);
+  logger.info({ secondaryJid, primaryJid }, 'JID linked');
+}
+
+/**
+ * Unlink a secondary JID. Persists to DB and updates in-memory cache.
+ */
+function handleUnlinkJid(secondaryJid: string): void {
+  unlinkJid(secondaryJid);
+  jidLinksCache.delete(secondaryJid);
+  logger.info({ secondaryJid }, 'JID unlinked');
+}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -95,8 +178,12 @@ function loadState(): void {
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
+  loadJidLinks();
   logger.info(
-    { groupCount: Object.keys(registeredGroups).length },
+    {
+      groupCount: Object.keys(registeredGroups).length,
+      jidLinks: jidLinksCache.size,
+    },
     'State loaded',
   );
 }
@@ -201,10 +288,45 @@ export function _setRegisteredGroups(
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
+  // Resolve linked JIDs: chatJid may be a secondary that maps to a primary group
+  const primaryJid = resolvePrimaryJid(chatJid);
+  const group = registeredGroups[primaryJid];
   if (!group) return true;
 
-  const channel = findChannel(channels, chatJid);
+  // Collect messages from the primary JID AND all linked secondary JIDs.
+  // Messages are stored under their original JID, so we must check all of them.
+  const allJids = [primaryJid, ...getSecondaryJids(primaryJid)];
+  let missedMessages: NewMessage[] = [];
+  let activeChannel: Channel | undefined;
+  let activeChatJid = chatJid; // the JID whose channel we'll reply through
+
+  for (const jid of allJids) {
+    const msgs = getMessagesSince(
+      jid,
+      getOrRecoverCursor(jid),
+      ASSISTANT_NAME,
+      MAX_MESSAGES_PER_PROMPT,
+    );
+    if (msgs.length > 0) {
+      missedMessages.push(...msgs);
+      // Use the channel of the JID that actually has messages for replies
+      const ch = findChannel(channels, jid);
+      if (ch) {
+        activeChannel = ch;
+        activeChatJid = jid;
+      }
+    }
+  }
+
+  // Sort by timestamp in case messages came from multiple channels
+  missedMessages.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+  // Trim to max
+  if (missedMessages.length > MAX_MESSAGES_PER_PROMPT) {
+    missedMessages = missedMessages.slice(-MAX_MESSAGES_PER_PROMPT);
+  }
+
+  const channel = activeChannel || findChannel(channels, chatJid);
   if (!channel) {
     logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
     return true;
@@ -212,31 +334,29 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const isMainGroup = group.isMain === true;
 
-  const missedMessages = getMessagesSince(
-    chatJid,
-    getOrRecoverCursor(chatJid),
-    ASSISTANT_NAME,
-    MAX_MESSAGES_PER_PROMPT,
-  );
-
   if (missedMessages.length === 0) return true;
 
   // --- Session command interception (before trigger check) ---
+  const isPrivateChat = !isMainGroup && group.requiresTrigger === false;
   const cmdResult = await handleSessionCommand({
     missedMessages,
     isMainGroup,
+    isPrivateChat,
     groupName: group.name,
     triggerPattern: getTriggerPattern(group.trigger),
     timezone: TIMEZONE,
     deps: {
-      sendMessage: (text) => channel.sendMessage(chatJid, text),
+      sendMessage: (text) => channel.sendMessage(activeChatJid, text),
       setTyping: (typing) =>
-        channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
+        channel.setTyping?.(activeChatJid, typing) ?? Promise.resolve(),
       runAgent: (prompt, onOutput) =>
-        runAgent(group, prompt, chatJid, [], onOutput),
-      closeStdin: () => queue.closeStdin(chatJid),
+        runAgent(group, prompt, activeChatJid, [], onOutput),
+      closeStdin: () => queue.closeStdin(primaryJid),
       advanceCursor: (ts) => {
-        lastAgentTimestamp[chatJid] = ts;
+        // Advance cursor for ALL linked JIDs so messages aren't re-fetched
+        for (const jid of allJids) {
+          lastAgentTimestamp[jid] = ts;
+        }
         saveState();
       },
       formatMessages,
@@ -250,7 +370,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           !reqTrigger ||
           (hasTrigger &&
             (msg.is_from_me ||
-              isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())))
+              isTriggerAllowed(
+                activeChatJid,
+                msg.sender,
+                loadSenderAllowlist(),
+              )))
         );
       },
     },
@@ -265,7 +389,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     const hasTrigger = missedMessages.some(
       (m) =>
         triggerPattern.test(m.content.trim()) &&
-        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+        (m.is_from_me ||
+          isTriggerAllowed(activeChatJid, m.sender, allowlistCfg)),
     );
     if (!hasTrigger) {
       return true;
@@ -275,11 +400,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const prompt = formatMessages(missedMessages, TIMEZONE);
   const imageAttachments = parseImageReferences(missedMessages);
 
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+  // Advance cursor for ALL linked JIDs so messages aren't re-fetched
+  const previousCursors: Record<string, string> = {};
+  const lastTs = missedMessages[missedMessages.length - 1].timestamp;
+  for (const jid of allJids) {
+    previousCursors[jid] = lastAgentTimestamp[jid] || '';
+    lastAgentTimestamp[jid] = lastTs;
+  }
   saveState();
 
   logger.info(
@@ -297,18 +424,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         { group: group.name },
         'Idle timeout, closing container stdin',
       );
-      queue.closeStdin(chatJid);
+      queue.closeStdin(primaryJid);
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
+  await channel.setTyping?.(activeChatJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
   const output = await runAgent(
     group,
     prompt,
-    chatJid,
+    activeChatJid,
     imageAttachments,
     async (result) => {
       // Streaming output callback — called for each agent result
@@ -321,7 +448,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
         logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
         if (text) {
-          await channel.sendMessage(chatJid, text);
+          try {
+            await channel.sendMessage(activeChatJid, text);
+          } catch (err) {
+            recordSendFailure(activeChatJid, text, group.folder, err);
+            throw err; // re-throw so the caller still sees the error
+          }
           outputSentToUser = true;
         }
         // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -329,7 +461,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       }
 
       if (result.status === 'success') {
-        queue.notifyIdle(chatJid);
+        queue.notifyIdle(primaryJid);
       }
 
       if (result.status === 'error') {
@@ -338,7 +470,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     },
   );
 
-  await channel.setTyping?.(chatJid, false);
+  await channel.setTyping?.(activeChatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -351,8 +483,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       return true;
     }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
+    // Roll back cursors for all linked JIDs so retries can re-process
+    for (const jid of allJids) {
+      lastAgentTimestamp[jid] = previousCursors[jid] || '';
+    }
     saveState();
     logger.warn(
       { group: group.name },
@@ -373,6 +507,10 @@ async function runAgent(
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
+  // Use primaryJid for queue registration so serialization is consistent
+  const queueJid = resolvePrimaryJid(chatJid);
+  // Determine which channel this message came from
+  const sourceChannel = findChannel(channels, chatJid)?.name;
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -411,6 +549,21 @@ async function runAgent(
       }
     : undefined;
 
+  // Pre-flight: if session file is near the critical threshold, inject
+  // /compact instead of the user prompt to prevent OOM during the run.
+  const PRE_FLIGHT_THRESHOLD = 2.5 * 1024 * 1024; // 2.5 MB — triggers before the 3 MB critical
+  const sessionSize = getSessionFileSize(group.folder, sessionId);
+  if (sessionSize > PRE_FLIGHT_THRESHOLD) {
+    logger.warn(
+      {
+        groupFolder: group.folder,
+        sessionSizeKB: Math.round(sessionSize / 1024),
+      },
+      'runAgent: session file near limit — injecting /compact before user prompt',
+    );
+    prompt = `/compact\n\nAfter compacting, process this original message:\n${prompt}`;
+  }
+
   try {
     const output = await runContainerAgent(
       group,
@@ -422,9 +575,10 @@ async function runAgent(
         isMain,
         assistantName: ASSISTANT_NAME,
         ...(imageAttachments.length > 0 && { imageAttachments }),
+        ...(sourceChannel && { sourceChannel }),
       },
       (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
+        queue.registerProcess(queueJid, proc, containerName, group.folder),
       wrappedOnOutput,
     );
 
@@ -459,7 +613,8 @@ async function startMessageLoop(): Promise<void> {
 
   while (true) {
     try {
-      const jids = Object.keys(registeredGroups);
+      // Include linked secondary JIDs in the poll so their messages are fetched
+      const jids = getAllPollableJids();
       const { messages, newTimestamp } = getNewMessages(
         jids,
         lastTimestamp,
@@ -473,20 +628,35 @@ async function startMessageLoop(): Promise<void> {
         lastTimestamp = newTimestamp;
         saveState();
 
-        // Deduplicate by group
-        const messagesByGroup = new Map<string, NewMessage[]>();
+        // Deduplicate by resolved primary JID so linked channels merge
+        // into one group entry. Track the original chatJid for each message
+        // so replies go back through the correct channel.
+        const messagesByGroup = new Map<
+          string,
+          { chatJid: string; messages: NewMessage[] }[]
+        >();
         for (const msg of messages) {
-          const existing = messagesByGroup.get(msg.chat_jid);
-          if (existing) {
-            existing.push(msg);
-          } else {
-            messagesByGroup.set(msg.chat_jid, [msg]);
+          const primaryJid = resolvePrimaryJid(msg.chat_jid);
+          const entries = messagesByGroup.get(primaryJid) || [];
+          // Find existing entry for this specific chatJid (channel)
+          let entry = entries.find((e) => e.chatJid === msg.chat_jid);
+          if (!entry) {
+            entry = { chatJid: msg.chat_jid, messages: [] };
+            entries.push(entry);
           }
+          entry.messages.push(msg);
+          messagesByGroup.set(primaryJid, entries);
         }
 
-        for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
+        for (const [primaryJid, channelEntries] of messagesByGroup) {
+          const group = registeredGroups[primaryJid];
           if (!group) continue;
+
+          // Use the first channel that has messages for routing
+          // (in practice, a single poll cycle usually has messages from one channel)
+          const firstEntry = channelEntries[0];
+          const chatJid = firstEntry.chatJid;
+          const groupMessages = channelEntries.flatMap((e) => e.messages);
 
           const channel = findChannel(channels, chatJid);
           if (!channel) {
@@ -510,18 +680,21 @@ async function startMessageLoop(): Promise<void> {
             // Only close active container if the sender is authorized — otherwise an
             // untrusted user could kill in-flight work by sending /compact (DoS).
             // closeStdin no-ops internally when no container is active.
+            const isPrivateChatLoop =
+              !isMainGroup && group.requiresTrigger === false;
             if (
               isSessionCommandAllowed(
                 isMainGroup,
                 loopCmdMsg.is_from_me === true,
+                isPrivateChatLoop,
               )
             ) {
-              queue.closeStdin(chatJid);
+              queue.closeStdin(primaryJid);
             }
             // Enqueue so processGroupMessages handles auth + cursor advancement.
             // Don't pipe via IPC — slash commands need a fresh container with
             // string prompt (not MessageStream) for SDK recognition.
-            queue.enqueueMessageCheck(chatJid);
+            queue.enqueueMessageCheck(primaryJid);
             continue;
           }
           // --- End session command interception ---
@@ -555,9 +728,10 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          // Use primaryJid for queue operations (serialization) but chatJid for outbound
+          if (queue.sendMessage(primaryJid, formatted)) {
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              { chatJid, primaryJid, count: messagesToSend.length },
               'Piped messages to active container',
             );
             lastAgentTimestamp[chatJid] =
@@ -571,7 +745,7 @@ async function startMessageLoop(): Promise<void> {
               );
           } else {
             // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
+            queue.enqueueMessageCheck(primaryJid);
           }
         }
       }
@@ -587,6 +761,7 @@ async function startMessageLoop(): Promise<void> {
  * Handles crash between advancing lastTimestamp and processing messages.
  */
 function recoverPendingMessages(): void {
+  // Check registered groups
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
     const pending = getMessagesSince(
       chatJid,
@@ -600,6 +775,22 @@ function recoverPendingMessages(): void {
         'Recovery: found unprocessed messages',
       );
       queue.enqueueMessageCheck(chatJid);
+    }
+  }
+  // Also check linked secondary JIDs for unprocessed messages
+  for (const [secondaryJid, primaryJid] of jidLinksCache) {
+    const pending = getMessagesSince(
+      secondaryJid,
+      getOrRecoverCursor(secondaryJid),
+      ASSISTANT_NAME,
+      MAX_MESSAGES_PER_PROMPT,
+    );
+    if (pending.length > 0) {
+      logger.info(
+        { secondaryJid, primaryJid, pendingCount: pending.length },
+        'Recovery: found unprocessed messages on linked JID',
+      );
+      queue.enqueueMessageCheck(primaryJid);
     }
   }
 }
@@ -623,10 +814,21 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
+  // Start Claude task server (Ulterior uses this to run host tasks via HTTP)
+  const taskServer = await startClaudeTaskServer(
+    CLAUDE_TASK_PORT,
+    PROXY_BIND_HOST,
+  );
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    // Force-close all keep-alive connections so port 3001 is released
+    // immediately. Without this, in-flight keep-alive connections hold the
+    // socket open and the next process start gets EADDRINUSE.
+    proxyServer.closeAllConnections();
     proxyServer.close();
+    taskServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -742,6 +944,7 @@ async function main(): Promise<void> {
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
     queue,
+    resolvePrimaryJid,
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
@@ -751,7 +954,14 @@ async function main(): Promise<void> {
         return;
       }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      if (text) {
+        try {
+          await channel.sendMessage(jid, text);
+        } catch (err) {
+          const groupFolder = registeredGroups[jid]?.folder ?? null;
+          recordSendFailure(jid, text, groupFolder, err);
+        }
+      }
     },
   });
   startIpcWatcher({
@@ -788,9 +998,79 @@ async function main(): Promise<void> {
         writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
       }
     },
+    linkJid: handleLinkJid,
+    unlinkJid: handleUnlinkJid,
   });
+  startPactBridge({
+    registeredGroups: () => registeredGroups,
+  });
+  initFormationHandler();
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+
+  // Start session file size monitor (Fix 1 — OOM prevention, with auto-compact)
+  startSessionMonitor(
+    () => registeredGroups,
+    (groupFolder: string) => {
+      // registeredGroups is keyed by JID — find the entry whose folder matches.
+      const entry = Object.entries(registeredGroups).find(
+        ([, g]) => g.folder === groupFolder,
+      );
+      if (!entry) {
+        logger.warn(
+          { groupFolder },
+          'auto-compact: group not found in registeredGroups',
+        );
+        return;
+      }
+      const [jid] = entry;
+      // Dedup: skip if there's already a pending /compact in the queue
+      if (hasPendingCompact(jid, ASSISTANT_NAME)) {
+        logger.info(
+          { groupFolder, jid },
+          'auto-compact: skipped — /compact already pending in queue',
+        );
+        return;
+      }
+      // Inject a synthetic /compact message as if sent by the session owner.
+      // is_from_me=true is required for session command authorisation checks.
+      storeMessageDirect({
+        id: `auto-compact-${Date.now()}`,
+        chat_jid: jid,
+        sender: jid,
+        sender_name: 'system',
+        content: '/compact',
+        timestamp: new Date().toISOString(),
+        is_from_me: true,
+        is_bot_message: false,
+      });
+      // Wake the message loop to process the injected command.
+      queue.enqueueMessageCheck(jid);
+      logger.info(
+        { groupFolder, jid },
+        'auto-compact: /compact injected into message queue',
+      );
+    },
+    // Hard ceiling callback: clear in-memory session after archive-and-reset
+    (groupFolder: string) => {
+      delete sessions[groupFolder];
+      logger.info(
+        { groupFolder },
+        'session-monitor: in-memory session cleared after hard reset',
+      );
+    },
+  );
+
+  // Start channel health monitor (Fix 2 — silent disconnect detection)
+  startChannelHealthMonitor(() => channels);
+
+  // Start dead letter queue retry worker (Fix 4 — outbound message recovery)
+  startDeadLetterWorker(async (jid, text) => {
+    const channel = findChannel(channels, jid);
+    if (!channel) throw new Error(`No channel for JID: ${jid}`);
+    await channel.sendMessage(jid, text);
+  });
+
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
     process.exit(1);

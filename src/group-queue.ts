@@ -14,6 +14,12 @@ interface QueuedTask {
 const MAX_RETRIES = 5;
 const BASE_RETRY_MS = 5000;
 
+/** How long to keep the circuit open before transitioning to half-open (ms). */
+const CIRCUIT_RESET_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Circuit breaker states per group. */
+export type CircuitState = 'closed' | 'open' | 'half-open';
+
 interface GroupState {
   active: boolean;
   idleWaiting: boolean;
@@ -25,6 +31,12 @@ interface GroupState {
   containerName: string | null;
   groupFolder: string | null;
   retryCount: number;
+  /** Circuit breaker state for this group. */
+  circuitState: CircuitState;
+  /** Timestamp (ms) when the circuit was opened; null when closed. */
+  circuitOpenedAt: number | null;
+  /** True when one probe message has been dispatched in half-open state. */
+  halfOpenProbeDispatched: boolean;
 }
 
 export class GroupQueue {
@@ -34,6 +46,20 @@ export class GroupQueue {
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
+
+  /**
+   * Folder-level locking: maps a folder name to the JID currently running a
+   * container against it. Prevents two JIDs sharing the same folder from
+   * spawning concurrent containers (which would corrupt the Claude session).
+   */
+  private activeFolders = new Map<string, string>();
+
+  /**
+   * Optional callback that resolves a JID to its group folder name.
+   * Set via setFolderResolver(). When provided, enables folder-level locking
+   * so multiple JIDs sharing a folder are serialized.
+   */
+  private folderResolver: ((jid: string) => string | null) | null = null;
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
@@ -49,14 +75,144 @@ export class GroupQueue {
         containerName: null,
         groupFolder: null,
         retryCount: 0,
+        circuitState: 'closed',
+        circuitOpenedAt: null,
+        halfOpenProbeDispatched: false,
       };
       this.groups.set(groupJid, state);
     }
     return state;
   }
 
+  /**
+   * Return the current circuit-breaker state for a group.
+   * Advances an open circuit to half-open if the reset timeout has elapsed.
+   */
+  getCircuitState(groupJid: string): CircuitState {
+    const state = this.groups.get(groupJid);
+    if (!state) return 'closed';
+    this.maybeAdvanceCircuit(groupJid, state);
+    return state.circuitState;
+  }
+
+  /**
+   * If the circuit is open and the reset timeout has elapsed, transition to
+   * half-open so one probe message can get through.
+   */
+  private maybeAdvanceCircuit(groupJid: string, state: GroupState): void {
+    if (
+      state.circuitState === 'open' &&
+      state.circuitOpenedAt !== null &&
+      Date.now() - state.circuitOpenedAt >= CIRCUIT_RESET_TIMEOUT_MS
+    ) {
+      state.circuitState = 'half-open';
+      state.halfOpenProbeDispatched = false;
+      logger.info({ groupJid }, 'Circuit breaker: transitioning to half-open');
+    }
+  }
+
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
+  }
+
+  /**
+   * Set a function that resolves a JID to its group folder name.
+   * Enables folder-level locking: if two JIDs share the same folder,
+   * only one container runs at a time for that folder.
+   */
+  setFolderResolver(fn: (jid: string) => string | null): void {
+    this.folderResolver = fn;
+  }
+
+  /**
+   * Check if the folder for a given JID is currently in use by another JID's container.
+   * Returns the folder name if busy, null if free.
+   */
+  private getFolderIfBusy(groupJid: string): string | null {
+    if (!this.folderResolver) return null;
+    const folder = this.folderResolver(groupJid);
+    if (!folder) return null;
+    const owner = this.activeFolders.get(folder);
+    if (owner && owner !== groupJid) return folder;
+    return null;
+  }
+
+  /**
+   * Acquire a folder lock for the given JID. Returns the folder name (or null
+   * if no resolver is set). The lock MUST be released in the finally block.
+   */
+  private acquireFolderLock(groupJid: string): string | null {
+    if (!this.folderResolver) return null;
+    const folder = this.folderResolver(groupJid);
+    if (folder) {
+      this.activeFolders.set(folder, groupJid);
+      logger.debug({ groupJid, folder }, 'Folder lock acquired');
+    }
+    return folder;
+  }
+
+  /**
+   * Release the folder lock and drain any JIDs waiting on the same folder.
+   */
+  private releaseFolderLock(folder: string | null, groupJid: string): void {
+    if (!folder) return;
+    const owner = this.activeFolders.get(folder);
+    if (owner === groupJid) {
+      this.activeFolders.delete(folder);
+      logger.debug({ groupJid, folder }, 'Folder lock released');
+
+      // Drain any other JIDs waiting on this folder
+      this.drainFolderWaiters(folder, groupJid);
+    }
+  }
+
+  /**
+   * After releasing a folder lock, check if any waiting JIDs need that folder
+   * and kick off their processing.
+   */
+  private drainFolderWaiters(folder: string, releasedByJid: string): void {
+    if (!this.folderResolver) return;
+
+    // Check waiting groups first
+    for (let i = 0; i < this.waitingGroups.length; i++) {
+      const waitingJid = this.waitingGroups[i];
+      if (waitingJid === releasedByJid) continue;
+      const waitingFolder = this.folderResolver(waitingJid);
+      if (waitingFolder === folder) {
+        // This JID was waiting for this folder — remove from waiting and process
+        this.waitingGroups.splice(i, 1);
+        const state = this.getGroup(waitingJid);
+        if (state.pendingTasks.length > 0) {
+          const task = state.pendingTasks.shift()!;
+          this.runTask(waitingJid, task).catch((err) =>
+            logger.error(
+              { groupJid: waitingJid, taskId: task.id, err },
+              'Unhandled error in runTask (folder drain)',
+            ),
+          );
+        } else if (state.pendingMessages) {
+          this.runForGroup(waitingJid, 'drain').catch((err) =>
+            logger.error(
+              { groupJid: waitingJid, err },
+              'Unhandled error in runForGroup (folder drain)',
+            ),
+          );
+        }
+        return; // Only drain one waiter at a time
+      }
+    }
+
+    // Also check all groups (some may have pending work but not be in waitingGroups)
+    for (const [jid, state] of this.groups) {
+      if (jid === releasedByJid) continue;
+      if (state.active) continue;
+      const jidFolder = this.folderResolver(jid);
+      if (jidFolder !== folder) continue;
+      if (state.pendingMessages || state.pendingTasks.length > 0) {
+        this.drainGroup(jid);
+        return;
+      }
+    }
   }
 
   enqueueMessageCheck(groupJid: string): void {
@@ -64,11 +220,55 @@ export class GroupQueue {
 
     const state = this.getGroup(groupJid);
 
+    // --- Circuit breaker check ---
+    this.maybeAdvanceCircuit(groupJid, state);
+    if (state.circuitState === 'open') {
+      logger.warn(
+        { groupJid },
+        'Circuit breaker open: rejecting message (will resume after reset timeout)',
+      );
+      return;
+    }
+    if (state.circuitState === 'half-open') {
+      if (state.halfOpenProbeDispatched) {
+        // Probe already in-flight; queue the message but don't start another run
+        state.pendingMessages = true;
+        logger.debug(
+          { groupJid },
+          'Circuit half-open: probe in-flight, message queued',
+        );
+        return;
+      }
+      // Allow exactly one probe through
+      state.halfOpenProbeDispatched = true;
+      logger.info({ groupJid }, 'Circuit breaker: dispatching half-open probe');
+    }
+    // --- End circuit breaker check ---
+
     if (state.active) {
       state.pendingMessages = true;
       logger.debug({ groupJid }, 'Container active, message queued');
       return;
     }
+
+    // --- Folder-level locking check ---
+    const busyFolder = this.getFolderIfBusy(groupJid);
+    if (busyFolder) {
+      state.pendingMessages = true;
+      if (!this.waitingGroups.includes(groupJid)) {
+        this.waitingGroups.push(groupJid);
+      }
+      logger.debug(
+        {
+          groupJid,
+          folder: busyFolder,
+          owner: this.activeFolders.get(busyFolder),
+        },
+        'Folder busy (shared session), message queued',
+      );
+      return;
+    }
+    // --- End folder-level locking check ---
 
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
       state.pendingMessages = true;
@@ -110,6 +310,21 @@ export class GroupQueue {
       logger.debug({ groupJid, taskId }, 'Container active, task queued');
       return;
     }
+
+    // --- Folder-level locking check ---
+    const busyFolder = this.getFolderIfBusy(groupJid);
+    if (busyFolder) {
+      state.pendingTasks.push({ id: taskId, groupJid, fn });
+      if (!this.waitingGroups.includes(groupJid)) {
+        this.waitingGroups.push(groupJid);
+      }
+      logger.debug(
+        { groupJid, taskId, folder: busyFolder },
+        'Folder busy (shared session), task queued',
+      );
+      return;
+    }
+    // --- End folder-level locking check ---
 
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
       state.pendingTasks.push({ id: taskId, groupJid, fn });
@@ -204,8 +419,11 @@ export class GroupQueue {
     state.pendingMessages = false;
     this.activeCount++;
 
+    // Acquire folder lock
+    const folder = this.acquireFolderLock(groupJid);
+
     logger.debug(
-      { groupJid, reason, activeCount: this.activeCount },
+      { groupJid, reason, activeCount: this.activeCount, folder },
       'Starting container for group',
     );
 
@@ -213,6 +431,16 @@ export class GroupQueue {
       if (this.processMessagesFn) {
         const success = await this.processMessagesFn(groupJid);
         if (success) {
+          // On success: reset retry count and close circuit if it was half-open
+          if (state.circuitState === 'half-open') {
+            state.circuitState = 'closed';
+            state.circuitOpenedAt = null;
+            state.halfOpenProbeDispatched = false;
+            logger.info(
+              { groupJid },
+              'Circuit breaker: probe succeeded, circuit closed',
+            );
+          }
           state.retryCount = 0;
         } else {
           this.scheduleRetry(groupJid, state);
@@ -227,6 +455,8 @@ export class GroupQueue {
       state.containerName = null;
       state.groupFolder = null;
       this.activeCount--;
+      // Release folder lock BEFORE draining so waiters can acquire it
+      this.releaseFolderLock(folder, groupJid);
       this.drainGroup(groupJid);
     }
   }
@@ -239,8 +469,11 @@ export class GroupQueue {
     state.runningTaskId = task.id;
     this.activeCount++;
 
+    // Acquire folder lock
+    const folder = this.acquireFolderLock(groupJid);
+
     logger.debug(
-      { groupJid, taskId: task.id, activeCount: this.activeCount },
+      { groupJid, taskId: task.id, activeCount: this.activeCount, folder },
       'Running queued task',
     );
 
@@ -256,18 +489,41 @@ export class GroupQueue {
       state.containerName = null;
       state.groupFolder = null;
       this.activeCount--;
+      // Release folder lock BEFORE draining so waiters can acquire it
+      this.releaseFolderLock(folder, groupJid);
       this.drainGroup(groupJid);
     }
   }
 
   private scheduleRetry(groupJid: string, state: GroupState): void {
     state.retryCount++;
-    if (state.retryCount > MAX_RETRIES) {
-      logger.error(
-        { groupJid, retryCount: state.retryCount },
-        'Max retries exceeded, dropping messages (will retry on next incoming message)',
+
+    // If we were in half-open and the probe failed, reopen the circuit immediately
+    if (state.circuitState === 'half-open') {
+      logger.warn(
+        { groupJid },
+        'Circuit breaker: half-open probe failed, reopening circuit',
       );
+      state.circuitState = 'open';
+      state.circuitOpenedAt = Date.now();
+      state.halfOpenProbeDispatched = false;
       state.retryCount = 0;
+      return;
+    }
+
+    if (state.retryCount > MAX_RETRIES) {
+      // Open the circuit — consecutive failure threshold exceeded
+      state.circuitState = 'open';
+      state.circuitOpenedAt = Date.now();
+      state.halfOpenProbeDispatched = false;
+      state.retryCount = 0;
+      logger.error(
+        {
+          groupJid,
+          resetInMs: CIRCUIT_RESET_TIMEOUT_MS,
+        },
+        'Circuit breaker: opened after max retries exceeded',
+      );
       return;
     }
 
@@ -290,6 +546,14 @@ export class GroupQueue {
 
     // Tasks first (they won't be re-discovered from SQLite like messages)
     if (state.pendingTasks.length > 0) {
+      // Check folder lock before starting
+      const busyFolder = this.getFolderIfBusy(groupJid);
+      if (busyFolder) {
+        if (!this.waitingGroups.includes(groupJid)) {
+          this.waitingGroups.push(groupJid);
+        }
+        return;
+      }
       const task = state.pendingTasks.shift()!;
       this.runTask(groupJid, task).catch((err) =>
         logger.error(
@@ -302,6 +566,14 @@ export class GroupQueue {
 
     // Then pending messages
     if (state.pendingMessages) {
+      // Check folder lock before starting
+      const busyFolder = this.getFolderIfBusy(groupJid);
+      if (busyFolder) {
+        if (!this.waitingGroups.includes(groupJid)) {
+          this.waitingGroups.push(groupJid);
+        }
+        return;
+      }
       this.runForGroup(groupJid, 'drain').catch((err) =>
         logger.error(
           { groupJid, err },
@@ -322,6 +594,14 @@ export class GroupQueue {
     ) {
       const nextJid = this.waitingGroups.shift()!;
       const state = this.getGroup(nextJid);
+
+      // Check folder lock before starting
+      const busyFolder = this.getFolderIfBusy(nextJid);
+      if (busyFolder) {
+        // Put it back at the end of the waiting list
+        this.waitingGroups.push(nextJid);
+        continue;
+      }
 
       // Prioritize tasks over messages
       if (state.pendingTasks.length > 0) {

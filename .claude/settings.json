@@ -1,1 +1,8 @@
-{}
+{
+  "mcpServers": {
+    "mac-host-bridge": {
+      "type": "http",
+      "url": "http://host.docker.internal:9222/mcp"
+    }
+  }
+}

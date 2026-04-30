@@ -44,6 +44,8 @@ export interface ContainerInput {
   assistantName?: string;
   imageAttachments?: Array<{ relativePath: string; mediaType: string }>;
   script?: string;
+  /** Which channel this message originated from (e.g. 'whatsapp', 'telegram'). */
+  sourceChannel?: string;
 }
 
 export interface ContainerOutput {
@@ -127,6 +129,22 @@ function buildVolumeMounts(
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
+    // Read optional per-group env overrides from config.json
+    let groupEnv: Record<string, string> = {};
+    const groupConfigPath = path.join(GROUPS_DIR, group.folder, 'config.json');
+    if (fs.existsSync(groupConfigPath)) {
+      try {
+        const groupConfig = JSON.parse(
+          fs.readFileSync(groupConfigPath, 'utf-8'),
+        );
+        if (groupConfig?.env && typeof groupConfig.env === 'object') {
+          groupEnv = groupConfig.env;
+        }
+      } catch {
+        // Malformed config.json — skip silently
+      }
+    }
+
     fs.writeFileSync(
       settingsFile,
       JSON.stringify(
@@ -141,6 +159,12 @@ function buildVolumeMounts(
             // Enable Claude's memory feature (persists user preferences between sessions)
             // https://code.claude.com/docs/en/memory#manage-auto-memory
             CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+            ...groupEnv,
+          },
+          mcpServers: {
+            'mac-host-bridge': {
+              url: 'http://host.docker.internal:9222/mcp',
+            },
           },
         },
         null,
@@ -187,12 +211,39 @@ function buildVolumeMounts(
     });
   }
 
+  // Google Drive credentials directory (for GDrive MCP inside the container)
+  const gdriveDir = path.join(homeDir, '.gdrive-mcp');
+  if (fs.existsSync(gdriveDir)) {
+    mounts.push({
+      hostPath: gdriveDir,
+      containerPath: '/home/node/.gdrive-mcp',
+      readonly: false, // MCP may need to refresh OAuth tokens
+    });
+  }
+
+  // Store directory — main group only (CoS agent needs access to all store files)
+  if (isMain) {
+    const storeDir = path.join(process.cwd(), 'store');
+    if (fs.existsSync(storeDir)) {
+      mounts.push({
+        hostPath: storeDir,
+        containerPath: '/workspace/store',
+        readonly: false,
+      });
+    }
+  }
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  // PACT custody directories for agent-to-agent custody transfers
+  fs.mkdirSync(path.join(groupIpcDir, 'custody', 'inbox'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'custody', 'outbox'), {
+    recursive: true,
+  });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -311,10 +362,7 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = await buildContainerArgs(
-    mounts,
-    containerName,
-  );
+  const containerArgs = await buildContainerArgs(mounts, containerName);
 
   logger.debug(
     {

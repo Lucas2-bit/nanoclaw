@@ -450,6 +450,7 @@ async function runQuery(
         'mcp__nanoclaw__*',
         'mcp__gmail__*',
         'mcp__calendar__*',
+        'mcp__mac-host-bridge__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -472,6 +473,10 @@ async function runQuery(
         calendar: {
           command: 'npx',
           args: ['-y', '@gongrzhe/server-calendar-autoauth-mcp'],
+        },
+        'mac-host-bridge': {
+          type: 'http' as const,
+          url: 'http://host.docker.internal:9222/mcp',
         },
       },
       hooks: {

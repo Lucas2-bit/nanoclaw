@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cloudflare.ulterior-dashboard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/cloudflared</string>
+        <string>tunnel</string>
+        <string>run</string>
+        <string>--token</string>
+        <string>eyJhIjoiNWM4NmM2NWJlMGEwYTNmOWM5OTBjNzc2MDQwOWU4YmQiLCJ0IjoiMGUxODA2YzItNDc1Yy00NDhlLTljNTAtZDMyMzRhZDIwYmIwIiwicyI6InJrWVEvQmZnMEFjMTJ0RFI0VGxLN1lzZHZpYm9PYVZYTzNjT2dmb0RKQ009In0=</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/ulterior-dashboard-tunnel.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/ulterior-dashboard-tunnel.log</string>
+</dict>
+</plist>

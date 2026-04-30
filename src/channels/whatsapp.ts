@@ -301,6 +301,36 @@ export class WhatsAppChannel implements Channel {
     });
   }
 
+  /** Track recently sent messages to prevent duplicates (key: jid+hash, expires after 60s) */
+  private recentlySent = new Map<string, number>();
+
+  private dedupeKey(jid: string, text: string): string {
+    // Simple hash: first 100 chars + length to avoid collisions without crypto overhead
+    return `${jid}:${text.length}:${text.slice(0, 100)}`;
+  }
+
+  private isDuplicate(jid: string, text: string): boolean {
+    const key = this.dedupeKey(jid, text);
+    const lastSent = this.recentlySent.get(key);
+    if (lastSent && Date.now() - lastSent < 60_000) {
+      logger.warn({ jid, length: text.length }, 'Duplicate message suppressed');
+      return true;
+    }
+    return false;
+  }
+
+  private markSent(jid: string, text: string): void {
+    const key = this.dedupeKey(jid, text);
+    this.recentlySent.set(key, Date.now());
+    // Clean up old entries every 100 sends
+    if (this.recentlySent.size > 200) {
+      const now = Date.now();
+      for (const [k, ts] of this.recentlySent) {
+        if (now - ts > 60_000) this.recentlySent.delete(k);
+      }
+    }
+  }
+
   async sendMessage(jid: string, text: string): Promise<void> {
     // Prefix bot messages with assistant name so users know who's speaking.
     // On a shared number, prefix is also needed in DMs (including self-chat)
@@ -310,7 +340,18 @@ export class WhatsAppChannel implements Channel {
       ? text
       : `${ASSISTANT_NAME}: ${text}`;
 
+    // Deduplicate: skip if same message was sent to same JID in last 60s
+    if (this.isDuplicate(jid, prefixed)) return;
+
     if (!this.connected) {
+      // Check queue for existing identical message before adding
+      const alreadyQueued = this.outgoingQueue.some(
+        (item) => item.jid === jid && item.text === prefixed,
+      );
+      if (alreadyQueued) {
+        logger.info({ jid }, 'Message already in queue, skipping duplicate');
+        return;
+      }
       this.outgoingQueue.push({ jid, text: prefixed });
       logger.info(
         { jid, length: prefixed.length, queueSize: this.outgoingQueue.length },
@@ -320,6 +361,7 @@ export class WhatsAppChannel implements Channel {
     }
     try {
       await this.sock.sendMessage(jid, { text: prefixed });
+      this.markSent(jid, prefixed);
       logger.info({ jid, length: prefixed.length }, 'Message sent');
     } catch (err) {
       // If send fails, queue it for retry on reconnect
@@ -342,6 +384,23 @@ export class WhatsAppChannel implements Channel {
   async disconnect(): Promise<void> {
     this.connected = false;
     this.sock?.end(undefined);
+  }
+
+  /**
+   * Liveness check for the WhatsApp channel.
+   * Returns true when the socket is connected.  If it is not connected,
+   * logs a warning and returns false so the caller can escalate after
+   * repeated failures.
+   *
+   * Note: reconnection is already handled automatically by the Baileys
+   * connection.update handler (scheduleReconnect).  This method only
+   * surfaces the current state for external health monitoring.
+   */
+  async healthCheck(): Promise<boolean> {
+    if (this.connected) return true;
+
+    logger.warn('WhatsApp health check: channel is not connected');
+    return false;
   }
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
@@ -438,14 +497,34 @@ export class WhatsAppChannel implements Channel {
     if (this.flushing || this.outgoingQueue.length === 0) return;
     this.flushing = true;
     try {
+      // Deduplicate queue before flushing
+      const seen = new Set<string>();
+      const deduped: typeof this.outgoingQueue = [];
+      for (const item of this.outgoingQueue) {
+        const key = this.dedupeKey(item.jid, item.text);
+        if (!seen.has(key)) {
+          seen.add(key);
+          deduped.push(item);
+        } else {
+          logger.info(
+            { jid: item.jid },
+            'Removed duplicate from outgoing queue',
+          );
+        }
+      }
+      this.outgoingQueue = deduped;
+
       logger.info(
         { count: this.outgoingQueue.length },
         'Flushing outgoing message queue',
       );
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue.shift()!;
+        // Skip if already sent recently (e.g. by another code path)
+        if (this.isDuplicate(item.jid, item.text)) continue;
         // Send directly — queued items are already prefixed by sendMessage
         await this.sock.sendMessage(item.jid, { text: item.text });
+        this.markSent(item.jid, item.text);
         logger.info(
           { jid: item.jid, length: item.text.length },
           'Queued message sent',

@@ -22,8 +22,9 @@ export function extractSessionCommand(
 export function isSessionCommandAllowed(
   isMainGroup: boolean,
   isFromMe: boolean,
+  isPrivateChat = false,
 ): boolean {
-  return isMainGroup || isFromMe;
+  return isMainGroup || isFromMe || isPrivateChat;
 }
 
 /** Minimal agent result interface — matches the subset of ContainerOutput used here. */
@@ -62,6 +63,7 @@ function resultToText(result: string | object | null | undefined): string {
 export async function handleSessionCommand(opts: {
   missedMessages: NewMessage[];
   isMainGroup: boolean;
+  isPrivateChat?: boolean;
   groupName: string;
   triggerPattern: RegExp;
   timezone: string;
@@ -70,6 +72,7 @@ export async function handleSessionCommand(opts: {
   const {
     missedMessages,
     isMainGroup,
+    isPrivateChat = false,
     groupName,
     triggerPattern,
     timezone,
@@ -85,7 +88,9 @@ export async function handleSessionCommand(opts: {
 
   if (!command || !cmdMsg) return { handled: false };
 
-  if (!isSessionCommandAllowed(isMainGroup, cmdMsg.is_from_me === true)) {
+  if (
+    !isSessionCommandAllowed(isMainGroup, !!cmdMsg.is_from_me, isPrivateChat)
+  ) {
     // DENIED: send denial if the sender would normally be allowed to interact,
     // then silently consume the command by advancing the cursor past it.
     // Trade-off: other messages in the same batch are also consumed (cursor is
@@ -97,8 +102,15 @@ export async function handleSessionCommand(opts: {
     return { handled: true, success: true };
   }
 
+  // Detect auto-compact: injected by session-monitor with sender_name 'system'.
+  // These should run silently — no output sent to the user.
+  const isSilent = cmdMsg.sender_name === 'system';
+
   // AUTHORIZED: process pre-compact messages first, then run the command
-  logger.info({ group: groupName, command }, 'Session command');
+  logger.info(
+    { group: groupName, command, silent: isSilent },
+    'Session command',
+  );
 
   const cmdIndex = missedMessages.indexOf(cmdMsg);
   const preCompactMsgs = missedMessages.slice(0, cmdIndex);
@@ -128,9 +140,11 @@ export async function handleSessionCommand(opts: {
         { group: groupName },
         'Pre-compact processing failed, aborting session command',
       );
-      await deps.sendMessage(
-        `Failed to process messages before ${command}. Try again.`,
-      );
+      if (!isSilent) {
+        await deps.sendMessage(
+          `Failed to process messages before ${command}. Try again.`,
+        );
+      }
       if (preOutputSent) {
         // Output was already sent — don't retry or it will duplicate.
         // Advance cursor past pre-compact messages, leave command pending.
@@ -142,21 +156,35 @@ export async function handleSessionCommand(opts: {
   }
 
   // Forward the literal slash command as the prompt (no XML formatting)
-  await deps.setTyping(true);
+  if (!isSilent) {
+    await deps.setTyping(true);
+  }
 
   let hadCmdError = false;
   const cmdOutput = await deps.runAgent(command, async (result) => {
     if (result.status === 'error') hadCmdError = true;
-    const text = resultToText(result.result);
-    if (text) await deps.sendMessage(text);
+    // Only send output to user if this is NOT an auto-compact (silent) command
+    if (!isSilent) {
+      const text = resultToText(result.result);
+      if (text) await deps.sendMessage(text);
+    }
   });
 
   // Advance cursor to the command — messages AFTER it remain pending for next poll.
   deps.advanceCursor(cmdMsg.timestamp);
-  await deps.setTyping(false);
+  if (!isSilent) {
+    await deps.setTyping(false);
+  }
 
   if (cmdOutput === 'error' || hadCmdError) {
-    await deps.sendMessage(`${command} failed. The session is unchanged.`);
+    if (!isSilent) {
+      await deps.sendMessage(`${command} failed. The session is unchanged.`);
+    } else {
+      logger.warn(
+        { group: groupName },
+        'session-commands: silent auto-compact failed',
+      );
+    }
   }
 
   return { handled: true, success: true };

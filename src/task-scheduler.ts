@@ -73,6 +73,8 @@ export interface SchedulerDependencies {
     groupFolder: string,
   ) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
+  /** Resolve a JID to its primary if linked (channel unification). */
+  resolvePrimaryJid?: (jid: string) => string;
 }
 
 async function runTask(
@@ -161,11 +163,16 @@ async function runTask(
   const TASK_CLOSE_DELAY_MS = 10000;
   let closeTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Resolve JID for queue operations (channel unification)
+  const queueJid = deps.resolvePrimaryJid
+    ? deps.resolvePrimaryJid(task.chat_jid)
+    : task.chat_jid;
+
   const scheduleClose = () => {
     if (closeTimer) return; // already scheduled
     closeTimer = setTimeout(() => {
       logger.debug({ taskId: task.id }, 'Closing task container after result');
-      deps.queue.closeStdin(task.chat_jid);
+      deps.queue.closeStdin(queueJid);
     }, TASK_CLOSE_DELAY_MS);
   };
 
@@ -183,16 +190,16 @@ async function runTask(
         script: task.script || undefined,
       },
       (proc, containerName) =>
-        deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
+        deps.onProcess(queueJid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
+          // Forward result to user via originating channel (not resolved JID)
           await deps.sendMessage(task.chat_jid, streamedOutput.result);
           scheduleClose();
         }
         if (streamedOutput.status === 'success') {
-          deps.queue.notifyIdle(task.chat_jid);
+          deps.queue.notifyIdle(queueJid);
           scheduleClose(); // Close promptly even when result is null (e.g. IPC-only tasks)
         }
         if (streamedOutput.status === 'error') {
@@ -264,7 +271,10 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           continue;
         }
 
-        deps.queue.enqueueTask(currentTask.chat_jid, currentTask.id, () =>
+        const taskQueueJid = deps.resolvePrimaryJid
+          ? deps.resolvePrimaryJid(currentTask.chat_jid)
+          : currentTask.chat_jid;
+        deps.queue.enqueueTask(taskQueueJid, currentTask.id, () =>
           runTask(currentTask, deps),
         );
       }

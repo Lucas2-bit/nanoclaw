@@ -23,6 +23,10 @@ export interface IpcDeps {
     registeredJids: Set<string>,
   ) => void;
   onTasksChanged: () => void;
+  /** Link a secondary JID to a primary JID (channel unification). */
+  linkJid?: (secondaryJid: string, primaryJid: string) => void;
+  /** Unlink a secondary JID. */
+  unlinkJid?: (secondaryJid: string) => void;
 }
 
 let ipcWatcherRunning = false;
@@ -173,6 +177,9 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For link_jid / unlink_jid
+    secondaryJid?: string;
+    primaryJid?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -458,6 +465,58 @@ export async function processTaskIpc(
         logger.warn(
           { data },
           'Invalid register_group request - missing required fields',
+        );
+      }
+      break;
+
+    case 'link_jid':
+      // Only main group can link JIDs (channel unification)
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized link_jid attempt blocked');
+        break;
+      }
+      if (data.secondaryJid && data.primaryJid && deps.linkJid) {
+        // Verify the primary JID is a registered group
+        if (!registeredGroups[data.primaryJid]) {
+          logger.warn(
+            { primaryJid: data.primaryJid },
+            'Cannot link: primary JID not registered',
+          );
+          break;
+        }
+        deps.linkJid(data.secondaryJid, data.primaryJid);
+        logger.info(
+          {
+            secondaryJid: data.secondaryJid,
+            primaryJid: data.primaryJid,
+            sourceGroup,
+          },
+          'JID linked via IPC',
+        );
+      } else {
+        logger.warn(
+          { data },
+          'Invalid link_jid request - missing required fields',
+        );
+      }
+      break;
+
+    case 'unlink_jid':
+      // Only main group can unlink JIDs
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized unlink_jid attempt blocked');
+        break;
+      }
+      if (data.secondaryJid && deps.unlinkJid) {
+        deps.unlinkJid(data.secondaryJid);
+        logger.info(
+          { secondaryJid: data.secondaryJid, sourceGroup },
+          'JID unlinked via IPC',
+        );
+      } else {
+        logger.warn(
+          { data },
+          'Invalid unlink_jid request - missing required fields',
         );
       }
       break;

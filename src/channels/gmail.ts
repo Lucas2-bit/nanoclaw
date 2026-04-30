@@ -84,10 +84,18 @@ export class GmailChannel implements Channel {
 
     this.gmail = google.gmail({ version: 'v1', auth: this.oauth2Client });
 
-    // Verify connection
-    const profile = await this.gmail.users.getProfile({ userId: 'me' });
-    this.userEmail = profile.data.emailAddress || '';
-    logger.info({ email: this.userEmail }, 'Gmail channel connected');
+    // Verify connection — non-fatal: if credentials are invalid, log and skip
+    try {
+      const profile = await this.gmail.users.getProfile({ userId: 'me' });
+      this.userEmail = profile.data.emailAddress || '';
+      logger.info({ email: this.userEmail }, 'Gmail channel connected');
+    } catch (err) {
+      logger.warn(
+        { err },
+        'Gmail credentials invalid — channel disabled. Re-run OAuth to fix.',
+      );
+      return;
+    }
 
     // Start polling with error backoff
     const schedulePoll = () => {
@@ -177,6 +185,30 @@ export class GmailChannel implements Channel {
     this.gmail = null;
     this.oauth2Client = null;
     logger.info('Gmail channel stopped');
+  }
+
+  /**
+   * Liveness check for the Gmail channel.
+   * Performs a lightweight OAuth token validation by calling
+   * users.getProfile.  Returns true when the token is valid, false when
+   * the call fails (expired / revoked token or network error).
+   *
+   * Note: the OAuth2 client auto-refreshes tokens via the 'tokens' event
+   * registered in connect(), so transient token expiry is handled
+   * transparently.  This check surfaces persistent auth failures.
+   */
+  async healthCheck(): Promise<boolean> {
+    if (!this.gmail) {
+      logger.warn('Gmail health check: channel not initialised');
+      return false;
+    }
+    try {
+      await this.gmail.users.getProfile({ userId: 'me' });
+      return true;
+    } catch (err) {
+      logger.warn({ err }, 'Gmail health check: token validation failed');
+      return false;
+    }
   }
 
   // --- Private ---
