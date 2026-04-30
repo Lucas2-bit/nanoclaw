@@ -6,8 +6,14 @@
 // Usage: node backup-gdrive-upload.js <file1> [file2] ...
 // Place this file at: ~/nanoclaw/backup-gdrive-upload.js
 
-const fs = require('fs');
-const path = require('path');
+import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import fs from 'fs';
+import path from 'path';
+
+const require = createRequire(import.meta.url);
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const { google } = require(path.join(__dirname, 'node_modules/googleapis'));
 
 const CREDENTIALS_PATH = path.join(process.env.HOME, '.gdrive-mcp/credentials.json');
