@@ -8,10 +8,10 @@ import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
 /** Session file size at which a warning is logged. */
-const WARN_THRESHOLD_BYTES = 500 * 1024; // 500 KB
+const WARN_THRESHOLD_BYTES = 300 * 1024; // 300 KB
 
-/** Session file size at which a critical alert is triggered and compact is triggered. */
-const CRITICAL_THRESHOLD_BYTES = 2 * 1024 * 1024; // 2 MB
+/** Session file size at which a critical alert is triggered and the session is archived. */
+const CRITICAL_THRESHOLD_BYTES = 600 * 1024; // 600 KB
 
 /** How often to check session file sizes (ms). */
 const CHECK_INTERVAL_MS = 60 * 1000; // 60 seconds — fast enough to catch runaway sessions
@@ -67,7 +67,7 @@ function writeAlertFile(message: string): void {
 }
 
 /** Hard ceiling threshold - archive and nuke, don't try to compact. */
-const HARD_CEILING_BYTES = 3 * 1024 * 1024; // 3 MB
+const HARD_CEILING_BYTES = 1 * 1024 * 1024; // 1 MB
 
 /**
  * Archive a session file by moving it to an archive directory.
@@ -171,32 +171,25 @@ export function checkSessionFileSizes(
         }
       }
     } else if (sizeBytes >= CRITICAL_THRESHOLD_BYTES) {
-      // Soft threshold: try to compact (may fail if session is already heavy)
+      // Archive immediately — compaction at this size causes API timeouts.
+      criticalCount++;
       const msg =
         `CRITICAL: Session file for group "${group.folder}" is ${sizeKB} KB ` +
-        `(threshold: ${CRITICAL_THRESHOLD_BYTES / 1024} KB). ` +
-        `Auto-compacting session to prevent hitting hard ceiling.`;
-      logger.warn(
+        `(threshold: ${CRITICAL_THRESHOLD_BYTES / 1024} KB). Archiving and resetting.`;
+      logger.error(
         { groupFolder: group.folder, sessionId, sizeKB },
-        'session-monitor: session approaching hard ceiling — triggering auto-compact',
+        'session-monitor: CRITICAL threshold hit — archiving session',
       );
       writeAlertFile(msg);
 
-      if (onCompact) {
-        const lastTriggered = lastCompactAt.get(group.folder) ?? 0;
-        const now = Date.now();
-        if (now - lastTriggered >= COMPACT_COOLDOWN_MS) {
-          lastCompactAt.set(group.folder, now);
-          logger.info(
-            { groupFolder: group.folder },
-            'session-monitor: injecting /compact',
-          );
+      if (archiveAndResetSession(group.folder, sessionId)) {
+        if (onSessionReset) {
           try {
-            onCompact(group.folder);
+            onSessionReset(group.folder);
           } catch (err) {
             logger.warn(
               { err, groupFolder: group.folder },
-              'session-monitor: auto-compact trigger failed',
+              'session-monitor: onSessionReset callback failed',
             );
           }
         }
