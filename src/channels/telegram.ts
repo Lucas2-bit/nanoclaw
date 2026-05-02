@@ -8,6 +8,7 @@ import { readEnvFile } from '../env.js';
 import { processImage } from '../image.js';
 import { logger } from '../logger.js';
 import { transcribeWithWhisperCpp } from '../transcription.js';
+import { transcribeWithGroq } from '../voice-transcription.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -321,9 +322,70 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:voice', (ctx) =>
-      transcribeVoice(ctx, '[Voice message]'),
-    );
+    this.bot.on('message:voice', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const voice = ctx.message.voice;
+      const duration = voice.duration || 0;
+
+      // Duration gate: reject audio over 2 minutes
+      if (duration > 120) {
+        logger.warn({ chatJid, duration }, 'Voice message too long, storing placeholder');
+        storeNonText(ctx, '[Voice message - too long to transcribe]');
+        return;
+      }
+
+      let content = '[Voice message]';
+
+      try {
+        // Download voice file from Telegram
+        const file = await ctx.api.getFile(voice.file_id);
+        const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+        const response = await fetch(fileUrl);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const buffer = Buffer.from(await response.arrayBuffer());
+
+        logger.info(
+          { chatJid, bytes: buffer.length, duration },
+          'Downloaded Telegram voice message',
+        );
+
+        // Transcribe via Groq Whisper API
+        const result = await transcribeWithGroq(buffer, duration);
+        if (result?.text) {
+          content = `[Voice: ${result.text}]`;
+          logger.info(
+            { chatJid, chars: result.text.length, language: result.language },
+            'Transcribed Telegram voice message',
+          );
+        } else {
+          content = '[Voice message - transcription unavailable]';
+        }
+      } catch (err: any) {
+        logger.error({ err: err.message, chatJid }, 'Telegram voice transcription failed');
+        content = '[Voice message - transcription failed]';
+      }
+
+      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+    });
     this.bot.on('message:audio', (ctx) => transcribeVoice(ctx, '[Audio]'));
     this.bot.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
@@ -409,6 +471,21 @@ export class TelegramChannel implements Channel {
       return false;
     }
     return true;
+  }
+
+  async sendVoiceNote(jid: string, audioBuffer: Buffer): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      await this.bot.api.sendVoice(numericId, new (await import('grammy')).InputFile(audioBuffer, 'voice.ogg'));
+      logger.info({ jid, bytes: audioBuffer.length }, 'Telegram voice note sent');
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send Telegram voice note');
+    }
   }
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {

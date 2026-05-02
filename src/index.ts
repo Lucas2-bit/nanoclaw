@@ -82,6 +82,7 @@ import { startSchedulerLoop } from './task-scheduler.js';
 import { getSessionFileSize, startSessionMonitor } from './session-monitor.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { parseImageReferences } from './image.js';
+import { generateSpeech } from './tts.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -326,6 +327,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     missedMessages = missedMessages.slice(-MAX_MESSAGES_PER_PROMPT);
   }
 
+  const hasVoiceInput = missedMessages.some(
+    (m) => m.content.startsWith('[Voice:') && !m.is_from_me,
+  );
+
   const channel = activeChannel || findChannel(channels, chatJid);
   if (!channel) {
     logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
@@ -455,6 +460,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             throw err; // re-throw so the caller still sees the error
           }
           outputSentToUser = true;
+
+          // Voice response: if input had voice messages and channel supports it, send TTS
+          if (hasVoiceInput && channel.sendVoiceNote && group.voiceEnabled) {
+            try {
+              const audioBuffer = await generateSpeech(text);
+              if (audioBuffer) {
+                await channel.sendVoiceNote(activeChatJid, audioBuffer);
+                logger.info(
+                  { group: group.name, bytes: audioBuffer.length },
+                  'Voice note response sent',
+                );
+              }
+            } catch (ttsErr) {
+              logger.warn({ err: ttsErr }, 'TTS voice response failed - text was sent');
+            }
+          }
         }
         // Only reset idle timer on actual results, not session-update markers (result: null)
         resetIdleTimer();
@@ -965,10 +986,30 @@ async function main(): Promise<void> {
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: async (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      await channel.sendMessage(jid, text);
+
+      // TTS: if recent conversation had voice input, also send a voice note
+      if (channel.sendVoiceNote) {
+        try {
+          const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+          const recentMsgs = getMessagesSince(jid, fiveMinAgo, '__bot__', 20);
+          const hasVoice = recentMsgs.some(
+            (m) => m.content.startsWith('[Voice:') && !m.is_from_me,
+          );
+          if (hasVoice) {
+            const audioBuffer = await generateSpeech(text);
+            if (audioBuffer) {
+              await channel.sendVoiceNote(jid, audioBuffer);
+              logger.info({ jid, bytes: audioBuffer.length }, 'TTS voice note sent via IPC');
+            }
+          }
+        } catch (ttsErr) {
+          logger.warn({ err: ttsErr, jid }, 'TTS voice note failed - text was sent');
+        }
+      }
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

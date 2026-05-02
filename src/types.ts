@@ -40,6 +40,7 @@ export interface RegisteredGroup {
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
+  voiceEnabled?: boolean; // Opt-in: send TTS voice responses when input includes voice messages
 }
 
 export interface NewMessage {
@@ -95,6 +96,8 @@ export interface Channel {
   healthCheck(): Promise<boolean>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: send a voice note (audio buffer). Channels that support it implement it.
+  sendVoiceNote?(jid: string, audioBuffer: Buffer): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
 }
