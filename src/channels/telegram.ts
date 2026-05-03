@@ -403,21 +403,35 @@ export class TelegramChannel implements Channel {
       logger.error({ err: err.message }, 'Telegram bot error');
     });
 
-    // Start polling — returns a Promise that resolves when started
-    return new Promise<void>((resolve) => {
-      this.bot!.start({
-        onStart: (botInfo) => {
-          logger.info(
-            { username: botInfo.username, id: botInfo.id },
-            'Telegram bot connected',
-          );
-          console.log(`\n  Telegram bot: @${botInfo.username}`);
-          console.log(
-            `  Send /chatid to the bot to get a chat's registration ID\n`,
-          );
-          resolve();
-        },
-      });
+    // Start polling with timeout and error handling.
+    // Previously this Promise had no reject path — if bot.start() failed
+    // (bad token, network down, API unreachable), it hung forever, blocking
+    // the entire NanoClaw startup and eventually triggering a crash loop.
+    const CONNECT_TIMEOUT_MS = 30_000;
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error(`Telegram bot connect timed out after ${CONNECT_TIMEOUT_MS / 1000}s`));
+      }, CONNECT_TIMEOUT_MS);
+
+      try {
+        this.bot!.start({
+          onStart: (botInfo) => {
+            clearTimeout(timeout);
+            logger.info(
+              { username: botInfo.username, id: botInfo.id },
+              'Telegram bot connected',
+            );
+            console.log(`\n  Telegram bot: @${botInfo.username}`);
+            console.log(
+              `  Send /chatid to the bot to get a chat's registration ID\n`,
+            );
+            resolve();
+          },
+        });
+      } catch (err) {
+        clearTimeout(timeout);
+        reject(err);
+      }
     });
   }
 

@@ -16,6 +16,7 @@
 import { createServer, Server } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, RequestOptions } from 'http';
+import { execSync } from 'child_process';
 import { Transform, TransformCallback } from 'stream';
 
 import { readEnvFile } from './env.js';
@@ -32,6 +33,35 @@ export type AuthMode = 'api-key' | 'oauth';
 
 export interface ProxyConfig {
   authMode: AuthMode;
+}
+
+/**
+ * Force-kill any process holding the given port.
+ * Returns true if a process was found and killed.
+ */
+function clearPort(port: number): boolean {
+  try {
+    const pids = execSync(`lsof -ti :${port}`, {
+      encoding: 'utf8',
+      timeout: 5000,
+    }).trim();
+    if (!pids) return false;
+
+    for (const pid of pids.split('\n').filter(Boolean)) {
+      try {
+        process.kill(Number(pid.trim()), 'SIGTERM');
+        logger.info({ pid: pid.trim(), port }, 'Killed zombie process on port');
+      } catch {
+        // Process already gone — fine
+      }
+    }
+    // Brief pause to let the OS release the socket
+    execSync('sleep 1');
+    return true;
+  } catch {
+    // lsof returns non-zero if nothing found — that means port is free
+    return false;
+  }
 }
 
 export function startCredentialProxy(
@@ -295,20 +325,27 @@ export function startCredentialProxy(
     // is released as soon as the server stops accepting new connections.
     server.keepAliveTimeout = 0;
 
+    // --- Improved startup: clear zombie processes before binding ---
+    // First attempt: try to listen directly
     server.listen(port, host, () => {
       logger.info({ port, host, authMode }, 'Credential proxy started');
       resolve(server);
     });
 
     let retryCount = 0;
-    const MAX_RETRIES = 5;
+    const MAX_RETRIES = 3;
     server.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE' && retryCount < MAX_RETRIES) {
         retryCount++;
         logger.warn(
           { port, attempt: retryCount, maxRetries: MAX_RETRIES },
-          'Credential proxy: port in use, retrying in 2s...',
+          'Credential proxy: port in use, killing zombie and retrying...',
         );
+
+        // Kill whatever is holding the port, then retry after a delay
+        clearPort(port);
+
+        const delay = retryCount * 3000; // 3s, 6s, 9s — increasing backoff
         setTimeout(() => {
           server.close();
           server.listen(port, host, () => {
@@ -318,7 +355,7 @@ export function startCredentialProxy(
             );
             resolve(server);
           });
-        }, 2000);
+        }, delay);
       } else {
         reject(err);
       }

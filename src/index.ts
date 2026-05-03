@@ -3,6 +3,7 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  DATA_DIR,
   DEFAULT_TRIGGER,
   getTriggerPattern,
   GROUPS_DIR,
@@ -35,6 +36,7 @@ import {
   getAllJidLinks,
   getAllRegisteredGroups,
   getAllSessions,
+  deleteSession,
   getAllTasks,
   getLastBotMessageTimestamp,
   getMessagesSince,
@@ -213,6 +215,38 @@ function getOrRecoverCursor(chatJid: string): string {
 function saveState(): void {
   setRouterState('last_timestamp', lastTimestamp);
   setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
+}
+
+/**
+ * Validate that every session in the DB has a corresponding JSONL file on disk.
+ * Remove stale entries that point to archived or deleted session files.
+ * This prevents "No conversation found with session ID" errors at container startup.
+ */
+function pruneStaleSessionIds(): void {
+  let pruned = 0;
+  for (const [groupFolder, sessionId] of Object.entries(sessions)) {
+    const sessionFilePath = path.join(
+      DATA_DIR,
+      'sessions',
+      groupFolder,
+      '.claude',
+      'projects',
+      '-workspace-group',
+      `${sessionId}.jsonl`,
+    );
+    if (!fs.existsSync(sessionFilePath)) {
+      logger.warn(
+        { groupFolder, sessionId, expectedPath: sessionFilePath },
+        'Stale session ID: JSONL file missing, removing DB entry',
+      );
+      deleteSession(groupFolder);
+      delete sessions[groupFolder];
+      pruned++;
+    }
+  }
+  if (pruned > 0) {
+    logger.info({ pruned }, 'Pruned stale session IDs on startup');
+  }
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -412,7 +446,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     previousCursors[jid] = lastAgentTimestamp[jid] || '';
     lastAgentTimestamp[jid] = lastTs;
   }
-  saveState();
 
   logger.info(
     { group: group.name, messageCount: missedMessages.length },
@@ -460,6 +493,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             throw err; // re-throw so the caller still sees the error
           }
           outputSentToUser = true;
+          // Persist cursor now that output was confirmed sent to user
+          saveState();
 
           // Voice response: if input had voice messages and channel supports it, send TTS
           if (hasVoiceInput && channel.sendVoiceNote && group.voiceEnabled) {
@@ -514,6 +549,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       'Agent error, rolled back message cursor for retry',
     );
     return false;
+  }
+
+  // Agent completed successfully. Persist cursor if not already saved.
+  if (!outputSentToUser) {
+    saveState();
   }
 
   return true;
@@ -757,7 +797,6 @@ async function startMessageLoop(): Promise<void> {
             );
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
-            saveState();
             // Show typing indicator while the container processes the piped message
             channel
               .setTyping?.(chatJid, true)
