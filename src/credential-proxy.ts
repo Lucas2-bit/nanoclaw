@@ -16,52 +16,16 @@
 import { createServer, Server } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, RequestOptions } from 'http';
-import { execSync } from 'child_process';
 import { Transform, TransformCallback } from 'stream';
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
-import {
-  extractModelFromRequest,
-  processResponse,
-  type TokenUsage,
-  logTelemetry,
-  type TelemetryEntry,
-} from './provider-router.js';
+import { extractModelFromRequest, processResponse, type TokenUsage, logTelemetry, type TelemetryEntry } from './provider-router.js';
 
 export type AuthMode = 'api-key' | 'oauth';
 
 export interface ProxyConfig {
   authMode: AuthMode;
-}
-
-/**
- * Force-kill any process holding the given port.
- * Returns true if a process was found and killed.
- */
-function clearPort(port: number): boolean {
-  try {
-    const pids = execSync(`lsof -ti :${port}`, {
-      encoding: 'utf8',
-      timeout: 5000,
-    }).trim();
-    if (!pids) return false;
-
-    for (const pid of pids.split('\n').filter(Boolean)) {
-      try {
-        process.kill(Number(pid.trim()), 'SIGTERM');
-        logger.info({ pid: pid.trim(), port }, 'Killed zombie process on port');
-      } catch {
-        // Process already gone — fine
-      }
-    }
-    // Brief pause to let the OS release the socket
-    execSync('sleep 1');
-    return true;
-  } catch {
-    // lsof returns non-zero if nothing found — that means port is free
-    return false;
-  }
 }
 
 export function startCredentialProxy(
@@ -143,12 +107,7 @@ export function startCredentialProxy(
 
             res.writeHead(statusCode, upRes.headers);
 
-            if (
-              isMessagesEndpoint &&
-              isSSE &&
-              statusCode >= 200 &&
-              statusCode < 300
-            ) {
+            if (isMessagesEndpoint && isSSE && statusCode >= 200 && statusCode < 300) {
               // SSE stream: tee to extract usage from message_start and message_delta events
               let inputTokens = 0;
               let outputTokens = 0;
@@ -157,11 +116,7 @@ export function startCredentialProxy(
               let sseBuffer = '';
 
               const tee = new Transform({
-                transform(
-                  chunk: Buffer,
-                  _encoding: BufferEncoding,
-                  callback: TransformCallback,
-                ) {
+                transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback) {
                   // Pass chunk through to client immediately
                   this.push(chunk);
 
@@ -177,19 +132,11 @@ export function startCredentialProxy(
                     if (data === '[DONE]') continue;
                     try {
                       const event = JSON.parse(data);
-                      if (
-                        event.type === 'message_start' &&
-                        event.message?.usage
-                      ) {
+                      if (event.type === 'message_start' && event.message?.usage) {
                         inputTokens = event.message.usage.input_tokens || 0;
-                        cacheCreationTokens =
-                          event.message.usage.cache_creation_input_tokens || 0;
-                        cacheReadTokens =
-                          event.message.usage.cache_read_input_tokens || 0;
-                      } else if (
-                        event.type === 'message_delta' &&
-                        event.usage
-                      ) {
+                        cacheCreationTokens = event.message.usage.cache_creation_input_tokens || 0;
+                        cacheReadTokens = event.message.usage.cache_read_input_tokens || 0;
+                      } else if (event.type === 'message_delta' && event.usage) {
                         outputTokens = event.usage.output_tokens || 0;
                       }
                     } catch {
@@ -203,47 +150,15 @@ export function startCredentialProxy(
                   // Stream complete - log telemetry
                   if (inputTokens > 0 || outputTokens > 0) {
                     const model = extractModelFromRequest(body) || 'unknown';
-                    const pricing: Record<
-                      string,
-                      {
-                        input: number;
-                        output: number;
-                        cache_write: number;
-                        cache_read: number;
-                      }
-                    > = {
-                      'claude-opus-4-6': {
-                        input: 15.0,
-                        output: 75.0,
-                        cache_write: 18.75,
-                        cache_read: 1.5,
-                      },
-                      'claude-sonnet-4-6': {
-                        input: 3.0,
-                        output: 15.0,
-                        cache_write: 3.75,
-                        cache_read: 0.3,
-                      },
-                      'claude-haiku-4-5-20251001': {
-                        input: 0.8,
-                        output: 4.0,
-                        cache_write: 1.0,
-                        cache_read: 0.08,
-                      },
+                    const pricing: Record<string, { input: number; output: number; cache_write: number; cache_read: number }> = {
+                      'claude-opus-4-6':          { input: 15.0,  output: 75.0,  cache_write: 18.75,  cache_read: 1.50 },
+                      'claude-sonnet-4-6':        { input: 3.0,   output: 15.0,  cache_write: 3.75,   cache_read: 0.30 },
+                      'claude-haiku-4-5-20251001':{ input: 0.80,  output: 4.0,   cache_write: 1.0,    cache_read: 0.08 },
                     };
-                    const p = pricing[model] || {
-                      input: 3.0,
-                      output: 15.0,
-                      cache_write: 3.75,
-                      cache_read: 0.3,
-                    };
+                    const p = pricing[model] || { input: 3.0, output: 15.0, cache_write: 3.75, cache_read: 0.30 };
                     const perM = 1_000_000;
-                    const cost =
-                      (inputTokens * p.input +
-                        outputTokens * p.output +
-                        cacheCreationTokens * p.cache_write +
-                        cacheReadTokens * p.cache_read) /
-                      perM;
+                    const cost = (inputTokens * p.input + outputTokens * p.output +
+                      cacheCreationTokens * p.cache_write + cacheReadTokens * p.cache_read) / perM;
 
                     const entry: TelemetryEntry = {
                       ts: new Date().toISOString(),
@@ -268,12 +183,7 @@ export function startCredentialProxy(
               tee.on('end', () => res.end());
               tee.on('error', () => res.end());
               upRes.pipe(tee);
-            } else if (
-              isMessagesEndpoint &&
-              !isSSE &&
-              statusCode >= 200 &&
-              statusCode < 300
-            ) {
+            } else if (isMessagesEndpoint && !isSSE && statusCode >= 200 && statusCode < 300) {
               // Non-streaming response: buffer, extract usage, forward
               const responseChunks: Buffer[] = [];
               upRes.on('data', (chunk: Buffer) => {
@@ -282,13 +192,7 @@ export function startCredentialProxy(
               });
               upRes.on('end', () => {
                 const responseBody = Buffer.concat(responseChunks);
-                processResponse(
-                  body,
-                  responseBody,
-                  statusCode,
-                  requestPath,
-                  startTime,
-                );
+                processResponse(body, responseBody, statusCode, requestPath, startTime);
                 res.end();
               });
             } else {
@@ -325,40 +229,18 @@ export function startCredentialProxy(
     // is released as soon as the server stops accepting new connections.
     server.keepAliveTimeout = 0;
 
-    // --- Improved startup: clear zombie processes before binding ---
-    // First attempt: try to listen directly
+    // Port lifecycle is managed by pm2 (wait_ready + kill_timeout).
+    // pm2 guarantees the old process is fully dead before starting the
+    // new one, so EADDRINUSE should never happen. If it does, fail loud
+    // so pm2 can retry after its own backoff.
+    server.on('error', (err: NodeJS.ErrnoException) => {
+      logger.error({ err, port, host }, 'Credential proxy failed to bind');
+      reject(err);
+    });
+
     server.listen(port, host, () => {
       logger.info({ port, host, authMode }, 'Credential proxy started');
       resolve(server);
-    });
-
-    let retryCount = 0;
-    const MAX_RETRIES = 3;
-    server.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'EADDRINUSE' && retryCount < MAX_RETRIES) {
-        retryCount++;
-        logger.warn(
-          { port, attempt: retryCount, maxRetries: MAX_RETRIES },
-          'Credential proxy: port in use, killing zombie and retrying...',
-        );
-
-        // Kill whatever is holding the port, then retry after a delay
-        clearPort(port);
-
-        const delay = retryCount * 3000; // 3s, 6s, 9s — increasing backoff
-        setTimeout(() => {
-          server.close();
-          server.listen(port, host, () => {
-            logger.info(
-              { port, host, authMode, attempt: retryCount },
-              'Credential proxy started (retry)',
-            );
-            resolve(server);
-          });
-        }, delay);
-      } else {
-        reject(err);
-      }
     });
   });
 }

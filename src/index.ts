@@ -880,6 +880,15 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
+  // Signal pm2 that we have successfully bound the port and are ready.
+  // Requires wait_ready: true in ecosystem.config.cjs. pm2 will not
+  // start a new instance until the old one is fully dead, preventing
+  // EADDRINUSE race conditions.
+  if (typeof process.send === 'function') {
+    process.send('ready');
+    logger.info('Sent ready signal to pm2');
+  }
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
