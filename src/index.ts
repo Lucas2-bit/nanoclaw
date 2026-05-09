@@ -222,6 +222,8 @@ function saveState(): void {
  * Remove stale entries that point to archived or deleted session files.
  * This prevents "No conversation found with session ID" errors at container startup.
  */
+const GHOST_MAX_BYTES = 1024;
+
 function pruneStaleSessionIds(): void {
   let pruned = 0;
   for (const [groupFolder, sessionId] of Object.entries(sessions)) {
@@ -234,10 +236,15 @@ function pruneStaleSessionIds(): void {
       '-workspace-group',
       `${sessionId}.jsonl`,
     );
-    if (!fs.existsSync(sessionFilePath)) {
+    const fileExists = fs.existsSync(sessionFilePath);
+    const fileSize = fileExists ? fs.statSync(sessionFilePath).size : 0;
+    const isStub = fileExists && fileSize < 1024;
+    if (!fileExists || isStub) {
       logger.warn(
-        { groupFolder, sessionId, expectedPath: sessionFilePath },
-        'Stale session ID: JSONL file missing, removing DB entry',
+        { groupFolder, sessionId, expectedPath: sessionFilePath, fileSize },
+        isStub
+          ? 'Stale session ID: JSONL is a stub (< 1KB), removing DB entry'
+          : 'Stale session ID: JSONL file missing, removing DB entry',
       );
       deleteSession(groupFolder);
       delete sessions[groupFolder];
@@ -246,6 +253,101 @@ function pruneStaleSessionIds(): void {
   }
   if (pruned > 0) {
     logger.info({ pruned }, 'Pruned stale session IDs on startup');
+  }
+}
+
+
+function pruneOrphanSessionFiles(): void {
+  const sessionsDir = path.join(DATA_DIR, 'sessions');
+  if (!fs.existsSync(sessionsDir)) return;
+
+  const knownSessionIds = new Set(Object.values(sessions));
+  let removed = 0;
+  let archived = 0;
+
+  let groupFolders: string[];
+  try {
+    groupFolders = fs.readdirSync(sessionsDir).filter((f) => {
+      try {
+        return fs.statSync(path.join(sessionsDir, f)).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return;
+  }
+
+  for (const groupFolder of groupFolders) {
+    const projectDir = path.join(
+      sessionsDir,
+      groupFolder,
+      '.claude',
+      'projects',
+      '-workspace-group',
+    );
+    if (!fs.existsSync(projectDir)) continue;
+
+    let files: string[];
+    try {
+      files = fs.readdirSync(projectDir).filter((f) => f.endsWith('.jsonl'));
+    } catch {
+      continue;
+    }
+
+    for (const file of files) {
+      const sessionId = file.replace(/\.jsonl$/, '');
+      if (knownSessionIds.has(sessionId)) continue;
+
+      const filePath = path.join(projectDir, file);
+      let sizeBytes: number;
+      try {
+        sizeBytes = fs.statSync(filePath).size;
+      } catch {
+        continue;
+      }
+
+      if (sizeBytes <= GHOST_MAX_BYTES) {
+        try {
+          fs.unlinkSync(filePath);
+          removed++;
+          logger.info(
+            { groupFolder, sessionId, sizeBytes },
+            'Removed ghost session file (orphaned, under 1 KB)',
+          );
+        } catch (err) {
+          logger.warn(
+            { err, groupFolder, sessionId },
+            'Failed to remove ghost session file',
+          );
+        }
+      } else {
+        const archiveDir = path.join(DATA_DIR, 'session-archive', groupFolder);
+        try {
+          fs.mkdirSync(archiveDir, { recursive: true });
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const archiveName = `orphan_${sessionId}_${timestamp}.jsonl`;
+          fs.renameSync(filePath, path.join(archiveDir, archiveName));
+          archived++;
+          logger.warn(
+            { groupFolder, sessionId, sizeBytes, archiveName },
+            'Archived orphan session file (not in DB, over 1 KB)',
+          );
+        } catch (err) {
+          logger.warn(
+            { err, groupFolder, sessionId },
+            'Failed to archive orphan session file',
+          );
+        }
+      }
+    }
+  }
+
+  if (removed > 0 || archived > 0) {
+    logger.info(
+      { removed, archived },
+      'Orphan session cleanup complete',
+    );
   }
 }
 
@@ -567,7 +669,32 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  let sessionId: string | undefined = sessions[group.folder];
+
+  // Runtime validation: verify session JSONL exists before passing to container.
+  // pruneStaleSessionIds() only runs at startup -- if a file is archived or deleted
+  // mid-run, the in-memory map goes stale and containers fail with
+  // "No conversation found with session ID". This catches it at invocation time.
+  if (sessionId) {
+    const sessionFilePath = path.join(
+      DATA_DIR,
+      'sessions',
+      group.folder,
+      '.claude',
+      'projects',
+      '-workspace-group',
+      `${sessionId}.jsonl`,
+    );
+    if (!fs.existsSync(sessionFilePath)) {
+      logger.warn(
+        { groupFolder: group.folder, sessionId, expectedPath: sessionFilePath },
+        'Stale session detected at runtime -- clearing before container launch',
+      );
+      deleteSession(group.folder);
+      delete sessions[group.folder];
+      sessionId = undefined;
+    }
+  }
   // Use primaryJid for queue registration so serialization is consistent
   const queueJid = resolvePrimaryJid(chatJid);
   // Determine which channel this message came from
@@ -865,6 +992,9 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+  pruneStaleSessionIds();
+  pruneOrphanSessionFiles();
+  logger.info('Stale sessions pruned');
 
   restoreRemoteControl();
 

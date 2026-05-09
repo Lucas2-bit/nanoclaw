@@ -1,0 +1,8 @@
+name: parago-staging-deploy
+description: Deploy Parago to staging on push to main
+github:
+  owner: paracosm-holdings
+  name: parago
+  push:
+    branch: ^main$
+filename: cloudbuild-staging.yaml
