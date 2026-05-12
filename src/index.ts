@@ -224,27 +224,47 @@ function saveState(): void {
  */
 const GHOST_MAX_BYTES = 1024;
 
+/**
+ * Check whether a session ID has a valid backing store (JSONL file OR directory).
+ * Claude Code ≥ 4.x stores sessions as directories; older versions use .jsonl files.
+ * Returns 'file' | 'dir' | 'stub' | 'missing'.
+ */
+function sessionBackingStatus(
+  groupFolder: string,
+  sessionId: string,
+): 'file' | 'dir' | 'stub' | 'missing' {
+  const base = path.join(
+    DATA_DIR,
+    'sessions',
+    groupFolder,
+    '.claude',
+    'projects',
+    '-workspace-group',
+  );
+  const filePath = path.join(base, `${sessionId}.jsonl`);
+  const dirPath = path.join(base, sessionId);
+
+  if (fs.existsSync(filePath)) {
+    const size = fs.statSync(filePath).size;
+    return size < GHOST_MAX_BYTES ? 'stub' : 'file';
+  }
+  if (fs.existsSync(dirPath) && fs.statSync(dirPath).isDirectory()) {
+    return 'dir';
+  }
+  return 'missing';
+}
+
 function pruneStaleSessionIds(): void {
   let pruned = 0;
   for (const [groupFolder, sessionId] of Object.entries(sessions)) {
-    const sessionFilePath = path.join(
-      DATA_DIR,
-      'sessions',
-      groupFolder,
-      '.claude',
-      'projects',
-      '-workspace-group',
-      `${sessionId}.jsonl`,
-    );
-    const fileExists = fs.existsSync(sessionFilePath);
-    const fileSize = fileExists ? fs.statSync(sessionFilePath).size : 0;
-    const isStub = fileExists && fileSize < 1024;
-    if (!fileExists || isStub) {
+    if (!sessionId) continue;
+    const status = sessionBackingStatus(groupFolder, sessionId);
+    if (status === 'missing' || status === 'stub') {
       logger.warn(
-        { groupFolder, sessionId, expectedPath: sessionFilePath, fileSize },
-        isStub
+        { groupFolder, sessionId, status },
+        status === 'stub'
           ? 'Stale session ID: JSONL is a stub (< 1KB), removing DB entry'
-          : 'Stale session ID: JSONL file missing, removing DB entry',
+          : 'Stale session ID: no backing file or directory, removing DB entry',
       );
       deleteSession(groupFolder);
       delete sessions[groupFolder];
@@ -671,23 +691,14 @@ async function runAgent(
   const isMain = group.isMain === true;
   let sessionId: string | undefined = sessions[group.folder];
 
-  // Runtime validation: verify session JSONL exists before passing to container.
-  // pruneStaleSessionIds() only runs at startup -- if a file is archived or deleted
-  // mid-run, the in-memory map goes stale and containers fail with
-  // "No conversation found with session ID". This catches it at invocation time.
+  // Runtime validation: verify session backing store exists before passing to container.
+  // Handles both old .jsonl format and new directory-based format (Claude Code ≥ 4.x).
+  // pruneStaleSessionIds() only runs at startup; this catches mid-run stales.
   if (sessionId) {
-    const sessionFilePath = path.join(
-      DATA_DIR,
-      'sessions',
-      group.folder,
-      '.claude',
-      'projects',
-      '-workspace-group',
-      `${sessionId}.jsonl`,
-    );
-    if (!fs.existsSync(sessionFilePath)) {
+    const status = sessionBackingStatus(group.folder, sessionId);
+    if (status === 'missing' || status === 'stub') {
       logger.warn(
-        { groupFolder: group.folder, sessionId, expectedPath: sessionFilePath },
+        { groupFolder: group.folder, sessionId, status },
         'Stale session detected at runtime -- clearing before container launch',
       );
       deleteSession(group.folder);
@@ -726,10 +737,13 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Wrap onOutput to track session ID from streamed results
+  // Wrap onOutput to track session ID from streamed results.
+  // Only register newSessionId on success — error outputs re-emit the stale ID
+  // (from the agent-runner catch block) which would poison the DB and cause the
+  // next retry to also fail with "No conversation found".
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
+        if (output.newSessionId && output.status !== 'error') {
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId);
         }
@@ -770,7 +784,7 @@ async function runAgent(
       wrappedOnOutput,
     );
 
-    if (output.newSessionId) {
+    if (output.newSessionId && output.status !== 'error') {
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId);
     }
