@@ -259,12 +259,10 @@ function pruneStaleSessionIds(): void {
   for (const [groupFolder, sessionId] of Object.entries(sessions)) {
     if (!sessionId) continue;
     const status = sessionBackingStatus(groupFolder, sessionId);
-    if (status === 'missing' || status === 'stub') {
+    if (status === 'missing') {
       logger.warn(
         { groupFolder, sessionId, status },
-        status === 'stub'
-          ? 'Stale session ID: JSONL is a stub (< 1KB), removing DB entry'
-          : 'Stale session ID: no backing file or directory, removing DB entry',
+        'Stale session ID: no backing file or directory, removing DB entry',
       );
       deleteSession(groupFolder);
       delete sessions[groupFolder];
@@ -599,6 +597,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     imageAttachments,
     async (result) => {
       // Streaming output callback — called for each agent result
+      if (result.status === 'keepalive') {
+        resetIdleTimer();
+        return;
+      }
       if (result.result) {
         const raw =
           typeof result.result === 'string'

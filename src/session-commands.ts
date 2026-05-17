@@ -29,7 +29,7 @@ export function isSessionCommandAllowed(
 
 /** Minimal agent result interface — matches the subset of ContainerOutput used here. */
 export interface AgentResult {
-  status: 'success' | 'error';
+  status: 'success' | 'error' | 'keepalive';
   result?: string | object | null;
 }
 

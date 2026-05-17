@@ -17,8 +17,10 @@
 
 import { appendFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { logger } from './logger.js';
+import type { RoutingLog } from './model-selector.js';
 
 // ============================================================================
 // Types
@@ -60,16 +62,10 @@ export interface TelemetryEntry {
 }
 
 // ============================================================================
-// Anthropic Pricing (USD per million tokens, as of April 2026)
+// Pricing: loaded from model-routing.json via model-selector
 // ============================================================================
 
-const ANTHROPIC_PRICING: Record<string, { input: number; output: number; cache_write: number; cache_read: number }> = {
-  'claude-opus-4-6':          { input: 15.0,  output: 75.0,  cache_write: 18.75,  cache_read: 1.50 },
-  'claude-sonnet-4-6':        { input: 3.0,   output: 15.0,  cache_write: 3.75,   cache_read: 0.30 },
-  'claude-haiku-4-5-20251001':{ input: 0.80,  output: 4.0,   cache_write: 1.0,    cache_read: 0.08 },
-  // Fallback for unknown models
-  'default':                  { input: 3.0,   output: 15.0,  cache_write: 3.75,   cache_read: 0.30 },
-};
+import { getPricing, type TokenPricing } from './model-selector.js';
 
 // ============================================================================
 // Anthropic Adapter (v0.1 - the only real adapter)
@@ -103,7 +99,7 @@ class AnthropicAdapter implements ProviderAdapter {
   }
 
   calculateCost(model: string, usage: TokenUsage): number {
-    const pricing = ANTHROPIC_PRICING[model] || ANTHROPIC_PRICING['default'];
+    const pricing = getPricing(model);
     const perM = 1_000_000;
     return (
       (usage.input_tokens * pricing.input) / perM +
@@ -140,8 +136,11 @@ class OpenAIAdapter implements ProviderAdapter {
 // Provider Router
 // ============================================================================
 
-const DATA_DIR = join(process.cwd(), 'data');
+const __dirname = dirname(fileURLToPath(import.meta.url));
+// Use __dirname (not process.cwd()) so telemetry path survives pm2 restarts from any cwd
+const DATA_DIR = join(__dirname, '..', 'data');
 const TELEMETRY_FILE = join(DATA_DIR, 'api-calls.jsonl');
+const ROUTING_LOG_FILE = join(DATA_DIR, 'routing-decisions.jsonl');
 
 const adapters: ProviderAdapter[] = [
   new AnthropicAdapter(),
@@ -247,8 +246,23 @@ export function processResponse(
     status_code: statusCode,
   };
 
-  // Fire-and-forget - don't block the response
-  logTelemetry(entry).catch(() => {});
+  // Fire-and-forget - but log errors instead of swallowing them
+  logTelemetry(entry).catch((err) => {
+    logger.error({ err }, 'Telemetry fire-and-forget failed');
+  });
 }
 
-export { TELEMETRY_FILE, DATA_DIR };
+/**
+ * Log a routing decision for auditing and cost analysis.
+ */
+export async function logRoutingDecision(entry: RoutingLog): Promise<void> {
+  try {
+    await ensureDataDir();
+    const line = JSON.stringify(entry) + '\n';
+    await appendFile(ROUTING_LOG_FILE, line, 'utf-8');
+  } catch (err) {
+    logger.error({ err }, 'Failed to write routing log');
+  }
+}
+
+export { TELEMETRY_FILE, DATA_DIR, ROUTING_LOG_FILE };

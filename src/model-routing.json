@@ -1,0 +1,28 @@
+{
+  "models": {
+    "heavy": "claude-opus-4-7",
+    "medium": "claude-sonnet-4-6",
+    "light": "claude-haiku-4-5-20251001"
+  },
+  "pricing": {
+    "claude-opus-4-7":           { "input": 5.0,   "output": 25.0,  "cache_write": 6.25,  "cache_read": 0.50 },
+    "claude-opus-4-6":           { "input": 15.0,  "output": 75.0,  "cache_write": 18.75, "cache_read": 1.50 },
+    "claude-sonnet-4-6":         { "input": 3.0,   "output": 15.0,  "cache_write": 3.75,  "cache_read": 0.30 },
+    "claude-haiku-4-5-20251001": { "input": 0.80,  "output": 4.0,   "cache_write": 1.0,   "cache_read": 0.08 },
+    "default":                   { "input": 3.0,   "output": 15.0,  "cache_write": 3.75,  "cache_read": 0.30 }
+  },
+  "pinnedGroups": [
+    "telegram_main",
+    "whatsapp_main"
+  ],
+  "rules": [
+    { "condition": "isFormation", "complexity": "heavy", "reason": "formation" },
+    { "condition": "estimatedToolCalls > 5", "complexity": "heavy", "reason": "multi-tool-task" },
+    { "condition": "promptLength > 50000 && hasCodeContext", "complexity": "heavy", "reason": "long-code-context" },
+    { "condition": "promptLength > 50000 && !hasCodeContext", "complexity": "medium", "reason": "long-text-summary" },
+    { "condition": "hasCodeContext && promptLength < 10000", "complexity": "medium", "reason": "code-review" },
+    { "condition": "promptLength < 500 && !hasCodeContext", "complexity": "light", "reason": "triage" }
+  ],
+  "defaultComplexity": "medium",
+  "_comment": "Edit this file to update models/pricing without code changes. New model release? Update 'models' and 'pricing', restart nanoclaw."
+}

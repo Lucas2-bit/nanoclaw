@@ -17,10 +17,37 @@ import { createServer, Server } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, RequestOptions } from 'http';
 import { Transform, TransformCallback } from 'stream';
+import { execSync } from 'child_process';
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 import { extractModelFromRequest, processResponse, type TokenUsage, logTelemetry, type TelemetryEntry } from './provider-router.js';
+import { getPricing } from './model-selector.js';
+
+/**
+ * Kill any process holding the given port. Called before bind to prevent
+ * EADDRINUSE when pm2 restarts before the old process fully exits.
+ */
+function killPortHolder(port: number): void {
+  try {
+    const out = execSync(
+      `lsof -ti tcp:${port} -s tcp:listen 2>/dev/null || true`,
+      { encoding: 'utf-8', timeout: 5000 },
+    ).trim();
+    if (!out) return;
+    const pids = out.split('\n').filter(Boolean);
+    const myPid = String(process.pid);
+    for (const pid of pids) {
+      if (pid === myPid) continue;
+      logger.warn({ pid: Number(pid), port }, 'Killing stale process holding port');
+      try { process.kill(Number(pid), 'SIGKILL'); } catch {}
+    }
+    // Brief pause for OS to release the socket
+    execSync('sleep 0.5');
+  } catch (err) {
+    logger.warn({ err, port }, 'Port cleanup attempt failed (non-fatal)');
+  }
+}
 
 export type AuthMode = 'api-key' | 'oauth';
 
@@ -50,6 +77,9 @@ export function startCredentialProxy(
   const makeRequest = isHttps ? httpsRequest : httpRequest;
 
   return new Promise((resolve, reject) => {
+    // Kill any stale process holding our port before we try to bind.
+    killPortHolder(port);
+
     const server = createServer((req, res) => {
       // Disable keep-alive on individual responses so connections close
       // immediately after each request. This ensures the port is released
@@ -150,12 +180,7 @@ export function startCredentialProxy(
                   // Stream complete - log telemetry
                   if (inputTokens > 0 || outputTokens > 0) {
                     const model = extractModelFromRequest(body) || 'unknown';
-                    const pricing: Record<string, { input: number; output: number; cache_write: number; cache_read: number }> = {
-                      'claude-opus-4-6':          { input: 15.0,  output: 75.0,  cache_write: 18.75,  cache_read: 1.50 },
-                      'claude-sonnet-4-6':        { input: 3.0,   output: 15.0,  cache_write: 3.75,   cache_read: 0.30 },
-                      'claude-haiku-4-5-20251001':{ input: 0.80,  output: 4.0,   cache_write: 1.0,    cache_read: 0.08 },
-                    };
-                    const p = pricing[model] || { input: 3.0, output: 15.0, cache_write: 3.75, cache_read: 0.30 };
+                    const p = getPricing(model);
                     const perM = 1_000_000;
                     const cost = (inputTokens * p.input + outputTokens * p.output +
                       cacheCreationTokens * p.cache_write + cacheReadTokens * p.cache_read) / perM;
@@ -173,7 +198,9 @@ export function startCredentialProxy(
                       request_path: requestPath,
                       status_code: statusCode,
                     };
-                    logTelemetry(entry).catch(() => {});
+                    logTelemetry(entry).catch((err) => {
+                      logger.error({ err }, 'SSE telemetry fire-and-forget failed');
+                    });
                   }
                   callback();
                 },
