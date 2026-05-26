@@ -458,6 +458,7 @@ async function runQuery(
           'mcp__gmail__*',
           'mcp__calendar__*',
           'mcp__mac-host-bridge__*',
+          'mcp__entity-graph__*',
         ],
         env: sdkEnv,
         permissionMode: 'bypassPermissions',
@@ -484,6 +485,13 @@ async function runQuery(
           'mac-host-bridge': {
             type: 'http' as const,
             url: 'http://host.docker.internal:9222/mcp',
+          },
+          'entity-graph': {
+            command: 'node',
+            args: ['/workspace/group/ventures/ulterior/entity-graph/dist/entity-graph-mcp.js'],
+            env: {
+              ENTITY_GRAPH_DB: '/workspace/group/.data/entity_graph.db',
+            },
           },
         },
         hooks: {
