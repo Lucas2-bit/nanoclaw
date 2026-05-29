@@ -15,6 +15,7 @@ const CRITICAL_THRESHOLD_BYTES = 600 * 1024; // 600 KB
 
 /** How often to check session file sizes (ms). */
 const CHECK_INTERVAL_MS = 60 * 1000; // 60 seconds — fast enough to catch runaway sessions
+const STALE_SESSION_HOURS = 24;
 
 /**
  * Minimum time between auto-compact triggers for the same group (ms).
@@ -133,9 +134,10 @@ export function checkSessionFileSizes(
     const dir = sessionDir(group.folder);
     const filePath = path.join(dir, `${sessionId}.jsonl`);
 
+    let stat: fs.Stats;
     let sizeBytes: number;
     try {
-      const stat = fs.statSync(filePath);
+      stat = fs.statSync(filePath);
       sizeBytes = stat.size;
     } catch {
       // File doesn't exist yet — not an error
@@ -195,10 +197,30 @@ export function checkSessionFileSizes(
         }
       }
     } else if (sizeBytes >= WARN_THRESHOLD_BYTES) {
-      logger.warn(
-        { groupFolder: group.folder, sessionId, sizeKB },
-        'session-monitor: session file approaching size limit',
-      );
+      const isStale = (Date.now() - stat.mtimeMs) > STALE_SESSION_HOURS * 3600 * 1000;
+      if (isStale) {
+        logger.info(
+          { groupFolder: group.folder, sessionId, sizeKB },
+          'session-monitor: archiving stale session (warn zone + stale)',
+        );
+        if (archiveAndResetSession(group.folder, sessionId)) {
+          if (onSessionReset) {
+            try {
+              onSessionReset(group.folder);
+            } catch (err) {
+              logger.warn(
+                { err, groupFolder: group.folder },
+                'session-monitor: onSessionReset callback failed',
+              );
+            }
+          }
+        }
+      } else {
+        logger.warn(
+          { groupFolder: group.folder, sessionId, sizeKB },
+          'session-monitor: session file approaching size limit',
+        );
+      }
     }
   }
 

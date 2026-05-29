@@ -1,17 +1,23 @@
 module.exports = {
   apps: [{
     name: "nanoclaw",
-    script: "dist/index.js",
-    wait_ready: true,
-    listen_timeout: 30000,
+    script: "npm",
+    args: "start",
+    wait_ready: false,
     kill_timeout: 15000,
     restart_delay: 5000,
     max_restarts: 10,
     min_uptime: 10000,
     exp_backoff_restart_delay: 1000,
+    max_memory_restart: "1024M",
+    autorestart: true
+  }, {
+    name: "watchdog",
+    script: "src/watchdog-v2.cjs",
     autorestart: true,
-    env: {
-      NODE_ENV: "production"
-    }
+    max_restarts: 5,
+    min_uptime: 30000,
+    restart_delay: 10000,
+    watch: false
   }]
 };
