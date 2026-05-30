@@ -34,7 +34,7 @@ interface ContainerInput {
 
 interface ImageContentBlock {
   type: 'image';
-  source: { type: 'base64'; media_type: string; data: string };
+  source: { type: 'base64'; media_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'; data: string };
 }
 interface TextContentBlock {
   type: 'text';
@@ -370,7 +370,7 @@ async function runQuery(
       const imgPath = path.join('/workspace/group', img.relativePath);
       try {
         const data = fs.readFileSync(imgPath).toString('base64');
-        blocks.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data } });
+        blocks.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp', data } });
       } catch (err) {
         log(`Failed to load image: ${imgPath}`);
       }
@@ -473,18 +473,22 @@ async function runQuery(
               NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
               NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
             },
+            alwaysLoad: true,
           },
           gmail: {
             command: 'npx',
             args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
+            alwaysLoad: true,
           },
           calendar: {
             command: 'npx',
             args: ['-y', '@gongrzhe/server-calendar-autoauth-mcp'],
+            alwaysLoad: true,
           },
           'mac-host-bridge': {
             type: 'http' as const,
             url: 'http://host.docker.internal:9222/mcp',
+            alwaysLoad: true,
           },
           'entity-graph': {
             command: 'node',
@@ -492,6 +496,7 @@ async function runQuery(
             env: {
               ENTITY_GRAPH_DB: '/workspace/group/.data/entity_graph.db',
             },
+            alwaysLoad: true,
           },
         },
         hooks: {

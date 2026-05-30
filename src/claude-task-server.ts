@@ -135,7 +135,10 @@ export function startClaudeTaskServer(
           });
           res.end(JSON.stringify(result));
           logger.info(
-            { ok: result.ok, outputLength: result.ok ? result.output.length : 0 },
+            {
+              ok: result.ok,
+              outputLength: result.ok ? result.output.length : 0,
+            },
             'Claude task completed',
           );
         } catch (err: any) {

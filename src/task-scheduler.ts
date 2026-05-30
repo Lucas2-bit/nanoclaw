@@ -2,7 +2,12 @@ import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 
-import { ASSISTANT_NAME, DATA_DIR, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
+import {
+  ASSISTANT_NAME,
+  DATA_DIR,
+  SCHEDULER_POLL_INTERVAL,
+  TIMEZONE,
+} from './config.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -23,10 +28,18 @@ import { RegisteredGroup, ScheduledTask } from './types.js';
 
 /** Returns true if the session has a valid backing store (JSONL file or directory). */
 function sessionExists(groupFolder: string, sessionId: string): boolean {
-  const base = [DATA_DIR, 'sessions', groupFolder, '.claude', 'projects', '-workspace-group'];
+  const base = [
+    DATA_DIR,
+    'sessions',
+    groupFolder,
+    '.claude',
+    'projects',
+    '-workspace-group',
+  ];
   const filePath = [...base, `${sessionId}.jsonl`].join('/');
   const dirPath = [...base, sessionId].join('/');
-  if (fs.existsSync(filePath) && fs.statSync(filePath).size >= 1024) return true;
+  if (fs.existsSync(filePath) && fs.statSync(filePath).size >= 1024)
+    return true;
   if (fs.existsSync(dirPath) && fs.statSync(dirPath).isDirectory()) return true;
   return false;
 }
@@ -168,9 +181,10 @@ async function runTask(
   const sessions = deps.getSessions();
   const rawSessionId =
     task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
-  const sessionId = rawSessionId && sessionExists(task.group_folder, rawSessionId)
-    ? rawSessionId
-    : undefined;
+  const sessionId =
+    rawSessionId && sessionExists(task.group_folder, rawSessionId)
+      ? rawSessionId
+      : undefined;
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the

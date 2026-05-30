@@ -338,7 +338,10 @@ export class TelegramChannel implements Channel {
 
       // Duration gate: reject audio over 2 minutes
       if (duration > 120) {
-        logger.warn({ chatJid, duration }, 'Voice message too long, storing placeholder');
+        logger.warn(
+          { chatJid, duration },
+          'Voice message too long, storing placeholder',
+        );
         storeNonText(ctx, '[Voice message - too long to transcribe]');
         return;
       }
@@ -370,12 +373,22 @@ export class TelegramChannel implements Channel {
           content = '[Voice message - transcription unavailable]';
         }
       } catch (err: any) {
-        logger.error({ err: err.message, chatJid }, 'Telegram voice transcription failed');
+        logger.error(
+          { err: err.message, chatJid },
+          'Telegram voice transcription failed',
+        );
         content = '[Voice message - transcription failed]';
       }
 
-      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
       this.opts.onMessage(chatJid, {
         id: ctx.message.message_id.toString(),
         chat_jid: chatJid,
@@ -410,7 +423,11 @@ export class TelegramChannel implements Channel {
     const CONNECT_TIMEOUT_MS = 30_000;
     return new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        reject(new Error(`Telegram bot connect timed out after ${CONNECT_TIMEOUT_MS / 1000}s`));
+        reject(
+          new Error(
+            `Telegram bot connect timed out after ${CONNECT_TIMEOUT_MS / 1000}s`,
+          ),
+        );
       }, CONNECT_TIMEOUT_MS);
 
       try {
@@ -495,8 +512,14 @@ export class TelegramChannel implements Channel {
 
     try {
       const numericId = jid.replace(/^tg:/, '');
-      await this.bot.api.sendVoice(numericId, new (await import('grammy')).InputFile(audioBuffer, 'voice.ogg'));
-      logger.info({ jid, bytes: audioBuffer.length }, 'Telegram voice note sent');
+      await this.bot.api.sendVoice(
+        numericId,
+        new (await import('grammy')).InputFile(audioBuffer, 'voice.ogg'),
+      );
+      logger.info(
+        { jid, bytes: audioBuffer.length },
+        'Telegram voice note sent',
+      );
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram voice note');
     }

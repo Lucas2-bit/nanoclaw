@@ -21,7 +21,13 @@ import { execSync } from 'child_process';
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
-import { extractModelFromRequest, processResponse, type TokenUsage, logTelemetry, type TelemetryEntry } from './provider-router.js';
+import {
+  extractModelFromRequest,
+  processResponse,
+  type TokenUsage,
+  logTelemetry,
+  type TelemetryEntry,
+} from './provider-router.js';
 import { getPricing } from './model-selector.js';
 
 /**
@@ -39,8 +45,13 @@ function killPortHolder(port: number): void {
     const myPid = String(process.pid);
     for (const pid of pids) {
       if (pid === myPid) continue;
-      logger.warn({ pid: Number(pid), port }, 'Killing stale process holding port');
-      try { process.kill(Number(pid), 'SIGKILL'); } catch {}
+      logger.warn(
+        { pid: Number(pid), port },
+        'Killing stale process holding port',
+      );
+      try {
+        process.kill(Number(pid), 'SIGKILL');
+      } catch {}
     }
     // Brief pause for OS to release the socket
     execSync('sleep 0.5');
@@ -137,7 +148,12 @@ export function startCredentialProxy(
 
             res.writeHead(statusCode, upRes.headers);
 
-            if (isMessagesEndpoint && isSSE && statusCode >= 200 && statusCode < 300) {
+            if (
+              isMessagesEndpoint &&
+              isSSE &&
+              statusCode >= 200 &&
+              statusCode < 300
+            ) {
               // SSE stream: tee to extract usage from message_start and message_delta events
               let inputTokens = 0;
               let outputTokens = 0;
@@ -146,7 +162,11 @@ export function startCredentialProxy(
               let sseBuffer = '';
 
               const tee = new Transform({
-                transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback) {
+                transform(
+                  chunk: Buffer,
+                  _encoding: BufferEncoding,
+                  callback: TransformCallback,
+                ) {
                   // Pass chunk through to client immediately
                   this.push(chunk);
 
@@ -162,11 +182,19 @@ export function startCredentialProxy(
                     if (data === '[DONE]') continue;
                     try {
                       const event = JSON.parse(data);
-                      if (event.type === 'message_start' && event.message?.usage) {
+                      if (
+                        event.type === 'message_start' &&
+                        event.message?.usage
+                      ) {
                         inputTokens = event.message.usage.input_tokens || 0;
-                        cacheCreationTokens = event.message.usage.cache_creation_input_tokens || 0;
-                        cacheReadTokens = event.message.usage.cache_read_input_tokens || 0;
-                      } else if (event.type === 'message_delta' && event.usage) {
+                        cacheCreationTokens =
+                          event.message.usage.cache_creation_input_tokens || 0;
+                        cacheReadTokens =
+                          event.message.usage.cache_read_input_tokens || 0;
+                      } else if (
+                        event.type === 'message_delta' &&
+                        event.usage
+                      ) {
                         outputTokens = event.usage.output_tokens || 0;
                       }
                     } catch {
@@ -182,8 +210,12 @@ export function startCredentialProxy(
                     const model = extractModelFromRequest(body) || 'unknown';
                     const p = getPricing(model);
                     const perM = 1_000_000;
-                    const cost = (inputTokens * p.input + outputTokens * p.output +
-                      cacheCreationTokens * p.cache_write + cacheReadTokens * p.cache_read) / perM;
+                    const cost =
+                      (inputTokens * p.input +
+                        outputTokens * p.output +
+                        cacheCreationTokens * p.cache_write +
+                        cacheReadTokens * p.cache_read) /
+                      perM;
 
                     const entry: TelemetryEntry = {
                       ts: new Date().toISOString(),
@@ -199,7 +231,10 @@ export function startCredentialProxy(
                       status_code: statusCode,
                     };
                     logTelemetry(entry).catch((err) => {
-                      logger.error({ err }, 'SSE telemetry fire-and-forget failed');
+                      logger.error(
+                        { err },
+                        'SSE telemetry fire-and-forget failed',
+                      );
                     });
                   }
                   callback();
@@ -210,7 +245,12 @@ export function startCredentialProxy(
               tee.on('end', () => res.end());
               tee.on('error', () => res.end());
               upRes.pipe(tee);
-            } else if (isMessagesEndpoint && !isSSE && statusCode >= 200 && statusCode < 300) {
+            } else if (
+              isMessagesEndpoint &&
+              !isSSE &&
+              statusCode >= 200 &&
+              statusCode < 300
+            ) {
               // Non-streaming response: buffer, extract usage, forward
               const responseChunks: Buffer[] = [];
               upRes.on('data', (chunk: Buffer) => {
@@ -219,7 +259,13 @@ export function startCredentialProxy(
               });
               upRes.on('end', () => {
                 const responseBody = Buffer.concat(responseChunks);
-                processResponse(body, responseBody, statusCode, requestPath, startTime);
+                processResponse(
+                  body,
+                  responseBody,
+                  statusCode,
+                  requestPath,
+                  startTime,
+                );
                 res.end();
               });
             } else {

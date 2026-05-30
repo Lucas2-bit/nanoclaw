@@ -197,7 +197,8 @@ export function checkSessionFileSizes(
         }
       }
     } else if (sizeBytes >= WARN_THRESHOLD_BYTES) {
-      const isStale = (Date.now() - stat.mtimeMs) > STALE_SESSION_HOURS * 3600 * 1000;
+      const isStale =
+        Date.now() - stat.mtimeMs > STALE_SESSION_HOURS * 3600 * 1000;
       if (isStale) {
         logger.info(
           { groupFolder: group.folder, sessionId, sizeKB },

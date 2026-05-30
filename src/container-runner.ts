@@ -29,7 +29,11 @@ import {
 import { detectAuthMode } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
-import { selectModel, buildRoutingLog, type RoutingContext } from './model-selector.js';
+import {
+  selectModel,
+  buildRoutingLog,
+  type RoutingContext,
+} from './model-selector.js';
 import { logRoutingDecision } from './provider-router.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -138,7 +142,9 @@ function buildVolumeMounts(
     const groupConfigPath = path.join(GROUPS_DIR, group.folder, 'config.json');
     if (fs.existsSync(groupConfigPath)) {
       try {
-        const groupConfig = JSON.parse(fs.readFileSync(groupConfigPath, 'utf-8'));
+        const groupConfig = JSON.parse(
+          fs.readFileSync(groupConfigPath, 'utf-8'),
+        );
         if (groupConfig?.env && typeof groupConfig.env === 'object') {
           groupEnv = groupConfig.env;
         }
@@ -243,7 +249,9 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
   // PACT custody directories for agent-to-agent custody transfers
   fs.mkdirSync(path.join(groupIpcDir, 'custody', 'inbox'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'custody', 'outbox'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'custody', 'outbox'), {
+    recursive: true,
+  });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -370,11 +378,18 @@ export async function runContainerAgent(
   if (!effectiveModel) {
     const routingCtx: RoutingContext = {
       promptLength: input.prompt.length,
-      hasCodeContext: /\b(file|code|function|class|import|error|bug|src\/|\.ts|\.js|\.py)\b/i.test(input.prompt),
+      hasCodeContext:
+        /\b(file|code|function|class|import|error|bug|src\/|\.ts|\.js|\.py)\b/i.test(
+          input.prompt,
+        ),
       isScheduledTask: !!input.isScheduledTask,
       groupFolder: input.groupFolder,
       isFormation: /\b(form|formation|parago)\b/i.test(input.prompt),
-      estimatedToolCalls: (input.prompt.match(/\b(read|search|grep|find|check|look at|review)\b/gi) || []).length,
+      estimatedToolCalls: (
+        input.prompt.match(
+          /\b(read|search|grep|find|check|look at|review)\b/gi,
+        ) || []
+      ).length,
     };
     const decision = selectModel(routingCtx);
     effectiveModel = decision.model;
@@ -385,7 +400,12 @@ export async function runContainerAgent(
     });
 
     logger.info(
-      { group: group.name, model: decision.model, complexity: decision.complexity, reason: decision.reason },
+      {
+        group: group.name,
+        model: decision.model,
+        complexity: decision.complexity,
+        reason: decision.reason,
+      },
       'Model selected by dynamic routing',
     );
   }
@@ -393,7 +413,11 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = await buildContainerArgs(mounts, containerName, effectiveModel);
+  const containerArgs = await buildContainerArgs(
+    mounts,
+    containerName,
+    effectiveModel,
+  );
 
   logger.debug(
     {
