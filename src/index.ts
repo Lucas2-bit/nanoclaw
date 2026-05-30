@@ -58,7 +58,12 @@ import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { startPactBridge } from './pact-bridge.js';
 import { initFormationHandler } from './formation-handler.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  findChannel,
+  formatMessages,
+  formatOutbound,
+  routeOutbound,
+} from './router.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -97,6 +102,12 @@ let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
+/**
+ * Per-JID cursor snapshot captured at the start of each processGroupMessages
+ * run. Module-scope so the GroupQueue requeue callback can roll back cursors
+ * from the hang-timeout path (which fires outside the run's local scope).
+ */
+const previousCursors: Record<string, string> = {};
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
@@ -274,7 +285,6 @@ function pruneStaleSessionIds(): void {
   }
 }
 
-
 function pruneOrphanSessionFiles(): void {
   const sessionsDir = path.join(DATA_DIR, 'sessions');
   if (!fs.existsSync(sessionsDir)) return;
@@ -362,10 +372,7 @@ function pruneOrphanSessionFiles(): void {
   }
 
   if (removed > 0 || archived > 0) {
-    logger.info(
-      { removed, archived },
-      'Orphan session cleanup complete',
-    );
+    logger.info({ removed, archived }, 'Orphan session cleanup complete');
   }
 }
 
@@ -445,6 +452,10 @@ export function _setRegisteredGroups(
 async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Resolve linked JIDs: chatJid may be a secondary that maps to a primary group
   const primaryJid = resolvePrimaryJid(chatJid);
+  // Snapshot the run generation at entry — if it advances mid-run (timeout
+  // path superseded us, or a fresh run started), we must NOT roll back the
+  // cursor because the timeout path now owns requeue.
+  const myGen = queue.getGeneration(primaryJid);
   const group = registeredGroups[primaryJid];
   if (!group) return true;
 
@@ -559,8 +570,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const prompt = formatMessages(missedMessages, TIMEZONE);
   const imageAttachments = parseImageReferences(missedMessages);
 
-  // Advance cursor for ALL linked JIDs so messages aren't re-fetched
-  const previousCursors: Record<string, string> = {};
+  // Advance cursor for ALL linked JIDs so messages aren't re-fetched.
+  // previousCursors is module-scope (see top of file) so the queue's requeue
+  // callback can roll back from the hang-timeout path.
   const lastTs = missedMessages[missedMessages.length - 1].timestamp;
   for (const jid of allJids) {
     previousCursors[jid] = lastAgentTimestamp[jid] || '';
@@ -632,7 +644,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 );
               }
             } catch (ttsErr) {
-              logger.warn({ err: ttsErr }, 'TTS voice response failed - text was sent');
+              logger.warn(
+                { err: ttsErr },
+                'TTS voice response failed - text was sent',
+              );
             }
           }
         }
@@ -662,6 +677,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
       );
       return true;
+    }
+    if (queue.getGeneration(primaryJid) !== myGen) {
+      logger.info(
+        { jid: primaryJid },
+        'Run superseded by timeout/new run; skipping cursor rollback',
+      );
+      return false;
     }
     // Roll back cursors for all linked JIDs so retries can re-process
     for (const jid of allJids) {
@@ -1197,11 +1219,17 @@ async function main(): Promise<void> {
             const audioBuffer = await generateSpeech(text);
             if (audioBuffer) {
               await channel.sendVoiceNote(jid, audioBuffer);
-              logger.info({ jid, bytes: audioBuffer.length }, 'TTS voice note sent via IPC');
+              logger.info(
+                { jid, bytes: audioBuffer.length },
+                'TTS voice note sent via IPC',
+              );
             }
           }
         } catch (ttsErr) {
-          logger.warn({ err: ttsErr, jid }, 'TTS voice note failed - text was sent');
+          logger.warn(
+            { err: ttsErr, jid },
+            'TTS voice note failed - text was sent',
+          );
         }
       }
     },
@@ -1241,6 +1269,31 @@ async function main(): Promise<void> {
   });
   initFormationHandler();
   queue.setProcessMessagesFn(processGroupMessages);
+  queue.setNotifyMainFn(async (text) => {
+    const mainEntry = Object.entries(registeredGroups).find(
+      ([, g]) => g.isMain === true,
+    );
+    if (!mainEntry) {
+      logger.warn('notifyMain: no main group');
+      return;
+    }
+    try {
+      await routeOutbound(channels, mainEntry[0], text);
+    } catch (e) {
+      logger.error({ e }, 'notifyMain routeOutbound failed');
+    }
+  });
+  queue.setRequeueFn((primaryJid) => {
+    const jids = [primaryJid, ...getSecondaryJids(primaryJid)];
+    for (const jid of jids) {
+      lastAgentTimestamp[jid] = previousCursors[jid] || '';
+    }
+    saveState();
+    logger.info(
+      { jid: primaryJid },
+      'Hang timeout: cursor rolled back for requeue',
+    );
+  });
   recoverPendingMessages();
 
   // Start session file size monitor (Fix 1 — OOM prevention, with auto-compact)

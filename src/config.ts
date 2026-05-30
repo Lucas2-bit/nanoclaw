@@ -46,6 +46,13 @@ export const CONTAINER_TIMEOUT = parseInt(
   process.env.CONTAINER_TIMEOUT || '1800000',
   10,
 );
+// Absolute, non-resetting backstop ABOVE CONTAINER_TIMEOUT (30m) so the
+// container self-heals first in normal cases; this only fires on a true
+// hang/livelock (e.g. streaming chunks resetting CONTAINER_TIMEOUT forever).
+export const QUEUE_HARD_TIMEOUT = parseInt(
+  process.env.QUEUE_HARD_TIMEOUT || '5400000',
+  10,
+); // 90 min
 export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
   10,

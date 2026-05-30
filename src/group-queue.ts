@@ -2,7 +2,12 @@ import { ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+import {
+  DATA_DIR,
+  MAX_CONCURRENT_CONTAINERS,
+  QUEUE_HARD_TIMEOUT,
+} from './config.js';
+import { stopContainer } from './container-runtime.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -30,6 +35,13 @@ interface GroupState {
   process: ChildProcess | null;
   containerName: string | null;
   groupFolder: string | null;
+  /**
+   * Monotonic counter incremented at the start of every runForGroup and again
+   * when a run is abandoned via hang timeout. Lingering processGroupMessages
+   * calls capture this at entry and skip cursor rollback if it has advanced,
+   * because the timeout path owns requeue.
+   */
+  generation: number;
   retryCount: number;
   /** Circuit breaker state for this group. */
   circuitState: CircuitState;
@@ -45,6 +57,8 @@ export class GroupQueue {
   private waitingGroups: string[] = [];
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
+  private notifyMainFn?: (text: string) => Promise<void>;
+  private requeueFn?: (groupJid: string) => void;
   private shuttingDown = false;
 
   /**
@@ -74,6 +88,7 @@ export class GroupQueue {
         process: null,
         containerName: null,
         groupFolder: null,
+        generation: 0,
         retryCount: 0,
         circuitState: 'closed',
         circuitOpenedAt: null,
@@ -82,6 +97,15 @@ export class GroupQueue {
       this.groups.set(groupJid, state);
     }
     return state;
+  }
+
+  /**
+   * Return the current run generation for a group. Callers capture this at
+   * entry and re-check before mutating shared state; a mismatch means the run
+   * was superseded (timeout or a fresh run started).
+   */
+  getGeneration(groupJid: string): number {
+    return this.getGroup(groupJid).generation;
   }
 
   /**
@@ -113,6 +137,101 @@ export class GroupQueue {
 
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
+  }
+
+  setNotifyMainFn(fn: (text: string) => Promise<void>): void {
+    this.notifyMainFn = fn;
+  }
+
+  setRequeueFn(fn: (groupJid: string) => void): void {
+    this.requeueFn = fn;
+  }
+
+  /**
+   * Race a worker promise against QUEUE_HARD_TIMEOUT (absolute, non-resetting).
+   * A late rejection from `work` after the timeout wins is swallowed so it
+   * never surfaces as an unhandledRejection.
+   */
+  private async withHardTimeout<T>(
+    groupJid: string,
+    label: 'message' | 'task',
+    work: Promise<T>,
+  ): Promise<
+    | { status: 'done'; value: T }
+    | { status: 'error'; error: unknown }
+    | { status: 'timeout' }
+  > {
+    // Convert work's settlement into a tagged result so the race winner is
+    // always a resolved value. The onRejected branch also acts as the
+    // attached rejection handler — late rejections become resolved objects
+    // and never propagate as unhandledRejection.
+    const wrapped: Promise<
+      { status: 'done'; value: T } | { status: 'error'; error: unknown }
+    > = work.then(
+      (value) => ({ status: 'done' as const, value }),
+      (error) => ({ status: 'error' as const, error }),
+    );
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeout = new Promise<{ status: 'timeout' }>((resolve) => {
+      timer = setTimeout(
+        () => resolve({ status: 'timeout' as const }),
+        QUEUE_HARD_TIMEOUT,
+      );
+    });
+
+    const result = await Promise.race([wrapped, timeout]);
+    if (timer) clearTimeout(timer);
+
+    if (result.status === 'timeout') {
+      logger.warn(
+        { groupJid, label, timeoutMs: QUEUE_HARD_TIMEOUT },
+        'Queue hard timeout reached',
+      );
+    }
+    return result;
+  }
+
+  /**
+   * Kill the runaway container best-effort, then alert the main group.
+   * Does NOT touch state.active / activeCount / folder lock — the caller's
+   * finally block remains the single cleanup site.
+   */
+  private async handleHangTimeout(
+    groupJid: string,
+    state: GroupState,
+    label: 'message' | 'task',
+  ): Promise<void> {
+    logger.error(
+      { groupJid, containerName: state.containerName, label },
+      'Hang timeout: killing container',
+    );
+    if (state.containerName) {
+      try {
+        stopContainer(state.containerName);
+      } catch {
+        try {
+          state.process?.kill('SIGKILL');
+        } catch {
+          /* already dead */
+        }
+      }
+    } else {
+      try {
+        state.process?.kill('SIGKILL');
+      } catch {
+        /* already dead */
+      }
+    }
+    if (this.notifyMainFn) {
+      try {
+        await this.notifyMainFn(
+          `Agent hang detected on group ${groupJid} (${label}): exceeded ${Math.round(QUEUE_HARD_TIMEOUT / 60000)}m, container killed${label === 'message' ? ', message requeued' : ''}.`,
+        );
+      } catch (e) {
+        logger.error({ e }, 'notifyMain failed');
+      }
+    }
   }
 
   /**
@@ -417,6 +536,7 @@ export class GroupQueue {
     state.idleWaiting = false;
     state.isTaskContainer = false;
     state.pendingMessages = false;
+    state.generation++;
     this.activeCount++;
 
     // Acquire folder lock
@@ -429,21 +549,35 @@ export class GroupQueue {
 
     try {
       if (this.processMessagesFn) {
-        const success = await this.processMessagesFn(groupJid);
-        if (success) {
-          // On success: reset retry count and close circuit if it was half-open
-          if (state.circuitState === 'half-open') {
-            state.circuitState = 'closed';
-            state.circuitOpenedAt = null;
-            state.halfOpenProbeDispatched = false;
-            logger.info(
-              { groupJid },
-              'Circuit breaker: probe succeeded, circuit closed',
-            );
-          }
-          state.retryCount = 0;
-        } else {
+        const result = await this.withHardTimeout(
+          groupJid,
+          'message',
+          this.processMessagesFn(groupJid),
+        );
+        if (result.status === 'timeout') {
+          state.generation++;
+          this.requeueFn?.(groupJid);
+          await this.handleHangTimeout(groupJid, state, 'message');
           this.scheduleRetry(groupJid, state);
+        } else if (result.status === 'error') {
+          throw result.error;
+        } else {
+          const success = result.value;
+          if (success) {
+            // On success: reset retry count and close circuit if it was half-open
+            if (state.circuitState === 'half-open') {
+              state.circuitState = 'closed';
+              state.circuitOpenedAt = null;
+              state.halfOpenProbeDispatched = false;
+              logger.info(
+                { groupJid },
+                'Circuit breaker: probe succeeded, circuit closed',
+              );
+            }
+            state.retryCount = 0;
+          } else {
+            this.scheduleRetry(groupJid, state);
+          }
         }
       }
     } catch (err) {
@@ -478,9 +612,15 @@ export class GroupQueue {
     );
 
     try {
-      await task.fn();
-    } catch (err) {
-      logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
+      const result = await this.withHardTimeout(groupJid, 'task', task.fn());
+      if (result.status === 'timeout') {
+        await this.handleHangTimeout(groupJid, state, 'task');
+      } else if (result.status === 'error') {
+        logger.error(
+          { groupJid, taskId: task.id, err: result.error },
+          'Error running task',
+        );
+      }
     } finally {
       state.active = false;
       state.isTaskContainer = false;

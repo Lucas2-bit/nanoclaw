@@ -78,7 +78,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadConfig(): RoutingConfig {
   try {
-    const configPath = join(__dirname, 'model-routing.json');
+    // __dirname resolves to dist/ at runtime; model-routing.json lives in src/
+    const configPath = join(__dirname, '..', 'src', 'model-routing.json');
     const raw = readFileSync(configPath, 'utf-8');
     const config = JSON.parse(raw) as RoutingConfig;
     logger.info(
@@ -90,12 +91,12 @@ function loadConfig(): RoutingConfig {
     logger.warn({ err }, 'Failed to load model-routing.json, using defaults');
     return {
       models: {
-        heavy: 'claude-opus-4-7',
+        heavy: 'claude-opus-4-8',
         medium: 'claude-sonnet-4-6',
         light: 'claude-haiku-4-5-20251001',
       },
       pricing: {
-        'claude-opus-4-7': { input: 5.0, output: 25.0, cache_write: 6.25, cache_read: 0.50 },
+        'claude-opus-4-8': { input: 5.0, output: 25.0, cache_write: 6.25, cache_read: 0.50 },
         'claude-sonnet-4-6': { input: 3.0, output: 15.0, cache_write: 3.75, cache_read: 0.30 },
         'claude-haiku-4-5-20251001': { input: 0.80, output: 4.0, cache_write: 1.0, cache_read: 0.08 },
         default: { input: 3.0, output: 15.0, cache_write: 3.75, cache_read: 0.30 },
