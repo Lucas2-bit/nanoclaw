@@ -38,3 +38,4 @@ groups/global/*
 agents-sdk-docs
 backups/
 .bridge-backups/
+scripts/applied/

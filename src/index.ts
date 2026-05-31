@@ -13,6 +13,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import './channels/index.js';
+import { startAlertConsumer } from './alert-consumer.js';
 import {
   getChannelFactory,
   getRegisteredChannelNames,
@@ -1033,6 +1034,7 @@ async function main(): Promise<void> {
   pruneStaleSessionIds();
   pruneOrphanSessionFiles();
   logger.info('Stale sessions pruned');
+  startAlertConsumer();
 
   restoreRemoteControl();
 
