@@ -31,7 +31,10 @@ export interface ProviderAdapter {
   /** Can this adapter handle the given model? */
   supportsModel(model: string): boolean;
   /** Transform request headers for this provider */
-  transformHeaders(headers: Record<string, string>, credentials: Record<string, string>): Record<string, string>;
+  transformHeaders(
+    headers: Record<string, string>,
+    credentials: Record<string, string>,
+  ): Record<string, string>;
   /** Target upstream URL */
   getUpstreamUrl(): URL;
   /** Extract token usage from response body */
@@ -78,7 +81,10 @@ class AnthropicAdapter implements ProviderAdapter {
     return model.startsWith('claude-');
   }
 
-  transformHeaders(headers: Record<string, string>, credentials: Record<string, string>): Record<string, string> {
+  transformHeaders(
+    headers: Record<string, string>,
+    credentials: Record<string, string>,
+  ): Record<string, string> {
     // Credential proxy already handles auth injection - this is a no-op for v0.1
     return headers;
   }
@@ -116,20 +122,40 @@ class AnthropicAdapter implements ProviderAdapter {
 
 class OllamaAdapter implements ProviderAdapter {
   name = 'ollama';
-  supportsModel(model: string): boolean { return false; } // Not active in v0.1
-  transformHeaders(h: Record<string, string>): Record<string, string> { return h; }
-  getUpstreamUrl(): URL { return new URL('http://localhost:11434'); }
-  extractUsage(): TokenUsage | null { return null; }
-  calculateCost(): number { return 0; } // Local = free
+  supportsModel(model: string): boolean {
+    return false;
+  } // Not active in v0.1
+  transformHeaders(h: Record<string, string>): Record<string, string> {
+    return h;
+  }
+  getUpstreamUrl(): URL {
+    return new URL('http://localhost:11434');
+  }
+  extractUsage(): TokenUsage | null {
+    return null;
+  }
+  calculateCost(): number {
+    return 0;
+  } // Local = free
 }
 
 class OpenAIAdapter implements ProviderAdapter {
   name = 'openai';
-  supportsModel(model: string): boolean { return false; } // Not active in v0.1
-  transformHeaders(h: Record<string, string>): Record<string, string> { return h; }
-  getUpstreamUrl(): URL { return new URL('https://api.openai.com'); }
-  extractUsage(): TokenUsage | null { return null; }
-  calculateCost(): number { return 0; }
+  supportsModel(model: string): boolean {
+    return false;
+  } // Not active in v0.1
+  transformHeaders(h: Record<string, string>): Record<string, string> {
+    return h;
+  }
+  getUpstreamUrl(): URL {
+    return new URL('https://api.openai.com');
+  }
+  extractUsage(): TokenUsage | null {
+    return null;
+  }
+  calculateCost(): number {
+    return 0;
+  }
 }
 
 // ============================================================================
@@ -193,7 +219,11 @@ export async function logTelemetry(entry: TelemetryEntry): Promise<void> {
     const line = JSON.stringify(entry) + '\n';
     await appendFile(TELEMETRY_FILE, line, 'utf-8');
     logger.debug(
-      { model: entry.model, cost: entry.cost_usd.toFixed(4), tokens: entry.input_tokens + entry.output_tokens },
+      {
+        model: entry.model,
+        cost: entry.cost_usd.toFixed(4),
+        tokens: entry.input_tokens + entry.output_tokens,
+      },
       'API call logged',
     );
   } catch (err) {

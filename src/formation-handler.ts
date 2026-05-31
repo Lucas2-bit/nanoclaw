@@ -131,7 +131,12 @@ export function startFormation(
  */
 export function updateFormation(
   userId: string,
-  update: Partial<Pick<FormationSession, 'phase' | 'confidence' | 'domainsAssessed' | 'turnCount' | 'status'>>,
+  update: Partial<
+    Pick<
+      FormationSession,
+      'phase' | 'confidence' | 'domainsAssessed' | 'turnCount' | 'status'
+    >
+  >,
 ): FormationSession | null {
   loadIndex();
 
@@ -140,7 +145,8 @@ export function updateFormation(
 
   if (update.phase !== undefined) session.phase = update.phase;
   if (update.confidence !== undefined) session.confidence = update.confidence;
-  if (update.domainsAssessed !== undefined) session.domainsAssessed = update.domainsAssessed;
+  if (update.domainsAssessed !== undefined)
+    session.domainsAssessed = update.domainsAssessed;
   if (update.turnCount !== undefined) session.turnCount = update.turnCount;
   if (update.status !== undefined) session.status = update.status;
   session.lastActivity = new Date().toISOString();
@@ -185,11 +191,12 @@ export function getFormationStats(): {
 } {
   loadIndex();
   const sessions = Object.values(formationIndex.sessions);
-  const active = sessions.filter(s => s.status === 'active');
-  const completed = sessions.filter(s => s.status === 'completed');
-  const avgConf = sessions.length > 0
-    ? sessions.reduce((sum, s) => sum + s.confidence, 0) / sessions.length
-    : 0;
+  const active = sessions.filter((s) => s.status === 'active');
+  const completed = sessions.filter((s) => s.status === 'completed');
+  const avgConf =
+    sessions.length > 0
+      ? sessions.reduce((sum, s) => sum + s.confidence, 0) / sessions.length
+      : 0;
 
   return {
     totalSessions: sessions.length,
@@ -207,7 +214,10 @@ export function getFormationStats(): {
  * Generate the system prompt block that tells the agent about formation state.
  * Injected into the container agent's system prompt when formation is active.
  */
-export function getFormationPromptBlock(userId: string, userName: string): string | null {
+export function getFormationPromptBlock(
+  userId: string,
+  userName: string,
+): string | null {
   loadIndex();
   const session = formationIndex.sessions[userId];
   if (!session || session.status !== 'active') return null;
@@ -234,11 +244,13 @@ respond normally but note the formation is still active in the background.
  */
 export function isFormationTrigger(text: string): boolean {
   const lower = text.trim().toLowerCase();
-  return lower === '/form' ||
+  return (
+    lower === '/form' ||
     lower === '/formation' ||
     lower === '/parago' ||
     lower.startsWith('/form ') ||
-    lower === 'start formation';
+    lower === 'start formation'
+  );
 }
 
 // ============================================================
@@ -248,9 +260,14 @@ export function isFormationTrigger(text: string): boolean {
 export function initFormationHandler(): void {
   fs.mkdirSync(FORMATION_DIR, { recursive: true });
   loadIndex();
-  const active = Object.values(formationIndex.sessions).filter(s => s.status === 'active');
+  const active = Object.values(formationIndex.sessions).filter(
+    (s) => s.status === 'active',
+  );
   logger.info(
-    { totalSessions: Object.keys(formationIndex.sessions).length, activeSessions: active.length },
+    {
+      totalSessions: Object.keys(formationIndex.sessions).length,
+      activeSessions: active.length,
+    },
     'Formation handler initialised',
   );
 }

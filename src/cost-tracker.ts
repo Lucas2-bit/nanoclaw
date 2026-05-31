@@ -11,7 +11,11 @@ import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { logger } from './logger.js';
-import { type TelemetryEntry, DATA_DIR, TELEMETRY_FILE } from './provider-router.js';
+import {
+  type TelemetryEntry,
+  DATA_DIR,
+  TELEMETRY_FILE,
+} from './provider-router.js';
 
 // ============================================================================
 // Query Functions
@@ -67,7 +71,8 @@ function summarise(entries: TelemetryEntry[]): CostSummary {
     summary.total_cache_read_tokens += e.cache_read_tokens;
     totalLatency += e.latency_ms;
   }
-  summary.avg_latency_ms = entries.length > 0 ? totalLatency / entries.length : 0;
+  summary.avg_latency_ms =
+    entries.length > 0 ? totalLatency / entries.length : 0;
 
   return summary;
 }
@@ -81,7 +86,9 @@ export async function getCostToday(): Promise<CostSummary> {
 }
 
 /** Get cost breakdown by model since a given date. */
-export async function getCostByModel(since?: Date): Promise<Record<string, CostSummary>> {
+export async function getCostByModel(
+  since?: Date,
+): Promise<Record<string, CostSummary>> {
   const entries = await readEntries(since);
   const byModel: Record<string, TelemetryEntry[]> = {};
 
@@ -98,7 +105,9 @@ export async function getCostByModel(since?: Date): Promise<Record<string, CostS
 }
 
 /** Get cost breakdown by provider since a given date. */
-export async function getCostByProvider(since?: Date): Promise<Record<string, CostSummary>> {
+export async function getCostByProvider(
+  since?: Date,
+): Promise<Record<string, CostSummary>> {
   const entries = await readEntries(since);
   const byProvider: Record<string, TelemetryEntry[]> = {};
 
@@ -117,12 +126,14 @@ export async function getCostByProvider(since?: Date): Promise<Record<string, Co
 /** Get total cost for a time range. */
 export async function getCostRange(from: Date, to: Date): Promise<CostSummary> {
   const entries = await readEntries(from);
-  const filtered = entries.filter(e => new Date(e.ts) <= to);
+  const filtered = entries.filter((e) => new Date(e.ts) <= to);
   return summarise(filtered);
 }
 
 /** Check if daily spend exceeds a threshold. Returns null if under, or the summary if over. */
-export async function checkBudget(dailyLimitUsd: number): Promise<{ over: boolean; summary: CostSummary }> {
+export async function checkBudget(
+  dailyLimitUsd: number,
+): Promise<{ over: boolean; summary: CostSummary }> {
   const summary = await getCostToday();
   return { over: summary.total_usd >= dailyLimitUsd, summary };
 }

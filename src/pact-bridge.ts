@@ -116,7 +116,15 @@ function appendToChain(sessionId: string, envelope: PACTEnvelope): void {
   envelopes.push(envelope);
   fs.writeFileSync(
     chainPath,
-    JSON.stringify({ session_id: sessionId, envelopes, updated_at: new Date().toISOString() }, null, 2) + '\n',
+    JSON.stringify(
+      {
+        session_id: sessionId,
+        envelopes,
+        updated_at: new Date().toISOString(),
+      },
+      null,
+      2,
+    ) + '\n',
   );
 }
 
@@ -199,7 +207,10 @@ export function startPactBridge(deps: PactBridgeDeps): void {
     try {
       groupFolders = fs.readdirSync(ipcBaseDir).filter((f) => {
         try {
-          return fs.statSync(path.join(ipcBaseDir, f)).isDirectory() && f !== 'errors';
+          return (
+            fs.statSync(path.join(ipcBaseDir, f)).isDirectory() &&
+            f !== 'errors'
+          );
         } catch {
           return false;
         }
@@ -232,9 +243,15 @@ export function startPactBridge(deps: PactBridgeDeps): void {
       for (const file of files) {
         const filePath = path.join(outboxDir, file);
         try {
-          const data: CustodyIpcFile = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+          const data: CustodyIpcFile = JSON.parse(
+            fs.readFileSync(filePath, 'utf-8'),
+          );
 
-          if (data.type !== 'custody_envelope' || !data.envelope || !data.session_id) {
+          if (
+            data.type !== 'custody_envelope' ||
+            !data.envelope ||
+            !data.session_id
+          ) {
             logger.warn({ file, sourceGroup }, 'Invalid custody IPC file');
             fs.unlinkSync(filePath);
             continue;
@@ -251,19 +268,24 @@ export function startPactBridge(deps: PactBridgeDeps): void {
             const session = sessionIndex[sessionId];
             if (session) {
               // Route to the other agent's group
-              targetGroup = sourceGroup === session.ta_group
-                ? session.ra_group
-                : session.ta_group;
+              targetGroup =
+                sourceGroup === session.ta_group
+                  ? session.ra_group
+                  : session.ta_group;
             }
           }
 
           // For new sessions (PACT_OFFER), register in index
           if (envelope.message_type === 'PACT_OFFER') {
-            const raId = (envelope.body as { ra_agent_id?: string }).ra_agent_id;
+            const raId = (envelope.body as { ra_agent_id?: string })
+              .ra_agent_id;
 
             if (!targetGroup && raId) {
               // Default: target group is specified in the IPC file or we need it
-              logger.warn({ sessionId, sourceGroup }, 'PACT_OFFER missing target_group');
+              logger.warn(
+                { sessionId, sourceGroup },
+                'PACT_OFFER missing target_group',
+              );
               fs.unlinkSync(filePath);
               continue;
             }
@@ -283,7 +305,10 @@ export function startPactBridge(deps: PactBridgeDeps): void {
           }
 
           if (!targetGroup) {
-            logger.warn({ sessionId, sourceGroup }, 'Cannot determine target group for custody envelope');
+            logger.warn(
+              { sessionId, sourceGroup },
+              'Cannot determine target group for custody envelope',
+            );
             fs.unlinkSync(filePath);
             continue;
           }
@@ -319,11 +344,17 @@ export function startPactBridge(deps: PactBridgeDeps): void {
           // Clean up processed file
           fs.unlinkSync(filePath);
         } catch (err) {
-          logger.error({ file, sourceGroup, err }, 'Error processing custody file');
+          logger.error(
+            { file, sourceGroup, err },
+            'Error processing custody file',
+          );
           const errorDir = path.join(DATA_DIR, 'ipc', 'errors');
           fs.mkdirSync(errorDir, { recursive: true });
           try {
-            fs.renameSync(filePath, path.join(errorDir, `custody-${sourceGroup}-${file}`));
+            fs.renameSync(
+              filePath,
+              path.join(errorDir, `custody-${sourceGroup}-${file}`),
+            );
           } catch {
             // Best effort
           }
@@ -360,10 +391,16 @@ export function listSessions(filters?: {
     sessions = sessions.filter((s) => s.state === filters.state);
   }
   if (filters?.agentId) {
-    sessions = sessions.filter((s) => s.ta_id === filters.agentId || s.ra_id === filters.agentId);
+    sessions = sessions.filter(
+      (s) => s.ta_id === filters.agentId || s.ra_id === filters.agentId,
+    );
   }
   if (filters?.groupFolder) {
-    sessions = sessions.filter((s) => s.ta_group === filters.groupFolder || s.ra_group === filters.groupFolder);
+    sessions = sessions.filter(
+      (s) =>
+        s.ta_group === filters.groupFolder ||
+        s.ra_group === filters.groupFolder,
+    );
   }
 
   return sessions;

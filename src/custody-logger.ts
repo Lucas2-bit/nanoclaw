@@ -79,7 +79,10 @@ async function appendEvent(event: CustodyEvent): Promise<void> {
   await ensureDataDir();
   const line = JSON.stringify(event) + '\n';
   await appendFile(CUSTODY_FILE, line, 'utf-8');
-  logger.info({ task_id: event.task_id, type: event.type }, 'Custody event logged');
+  logger.info(
+    { task_id: event.task_id, type: event.type },
+    'Custody event logged',
+  );
 }
 
 // ============================================================================
@@ -219,9 +222,15 @@ export async function getCustodyMetrics(): Promise<CustodyMetrics> {
     try {
       const event = JSON.parse(line) as CustodyEvent;
       switch (event.type) {
-        case 'TRANSFER': transfers++; break;
-        case 'COMPLETE': completions++; break;
-        case 'ROLLBACK': rollbacks++; break;
+        case 'TRANSFER':
+          transfers++;
+          break;
+        case 'COMPLETE':
+          completions++;
+          break;
+        case 'ROLLBACK':
+          rollbacks++;
+          break;
         case 'VERIFY':
           verifications++;
           if ((event.data as VerifyData).result === 'pass') verifyPasses++;
@@ -237,7 +246,8 @@ export async function getCustodyMetrics(): Promise<CustodyMetrics> {
     total_completions: completions,
     total_rollbacks: rollbacks,
     total_verifications: verifications,
-    verification_pass_rate: verifications > 0 ? verifyPasses / verifications : 0,
+    verification_pass_rate:
+      verifications > 0 ? verifyPasses / verifications : 0,
     handoff_completion_rate: transfers > 0 ? completions / transfers : 0,
     rollback_frequency: transfers > 0 ? rollbacks / transfers : 0,
   };

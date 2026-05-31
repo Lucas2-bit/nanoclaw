@@ -66,7 +66,11 @@ interface RoutingConfig {
   models: Record<TaskComplexity, string>;
   pricing: Record<string, TokenPricing>;
   pinnedGroups: string[];
-  rules: Array<{ condition: string; complexity: TaskComplexity; reason: string }>;
+  rules: Array<{
+    condition: string;
+    complexity: TaskComplexity;
+    reason: string;
+  }>;
   defaultComplexity: TaskComplexity;
 }
 
@@ -96,10 +100,30 @@ function loadConfig(): RoutingConfig {
         light: 'claude-haiku-4-5-20251001',
       },
       pricing: {
-        'claude-opus-4-8': { input: 5.0, output: 25.0, cache_write: 6.25, cache_read: 0.50 },
-        'claude-sonnet-4-6': { input: 3.0, output: 15.0, cache_write: 3.75, cache_read: 0.30 },
-        'claude-haiku-4-5-20251001': { input: 0.80, output: 4.0, cache_write: 1.0, cache_read: 0.08 },
-        default: { input: 3.0, output: 15.0, cache_write: 3.75, cache_read: 0.30 },
+        'claude-opus-4-8': {
+          input: 5.0,
+          output: 25.0,
+          cache_write: 6.25,
+          cache_read: 0.5,
+        },
+        'claude-sonnet-4-6': {
+          input: 3.0,
+          output: 15.0,
+          cache_write: 3.75,
+          cache_read: 0.3,
+        },
+        'claude-haiku-4-5-20251001': {
+          input: 0.8,
+          output: 4.0,
+          cache_write: 1.0,
+          cache_read: 0.08,
+        },
+        default: {
+          input: 3.0,
+          output: 15.0,
+          cache_write: 3.75,
+          cache_read: 0.3,
+        },
       },
       pinnedGroups: ['telegram_main', 'whatsapp_main'],
       rules: [],
@@ -116,7 +140,15 @@ const config = loadConfig();
 
 /** Get pricing for a model (falls back to 'default' entry). */
 export function getPricing(model: string): TokenPricing {
-  return config.pricing[model] || config.pricing['default'] || { input: 3.0, output: 15.0, cache_write: 3.75, cache_read: 0.30 };
+  return (
+    config.pricing[model] ||
+    config.pricing['default'] || {
+      input: 3.0,
+      output: 15.0,
+      cache_write: 3.75,
+      cache_read: 0.3,
+    }
+  );
 }
 
 /** Get the full pricing table (for credential-proxy SSE telemetry). */
@@ -142,7 +174,7 @@ function evaluateCondition(condition: string, ctx: RoutingContext): boolean {
 
   // Compound conditions with &&
   if (c.includes('&&')) {
-    return c.split('&&').every(part => evaluateCondition(part, ctx));
+    return c.split('&&').every((part) => evaluateCondition(part, ctx));
   }
 
   // Numeric comparisons
@@ -153,18 +185,30 @@ function evaluateCondition(condition: string, ctx: RoutingContext): boolean {
     let actual: number;
 
     switch (field) {
-      case 'promptLength': actual = ctx.promptLength; break;
-      case 'estimatedToolCalls': actual = ctx.estimatedToolCalls ?? 0; break;
-      default: return false;
+      case 'promptLength':
+        actual = ctx.promptLength;
+        break;
+      case 'estimatedToolCalls':
+        actual = ctx.estimatedToolCalls ?? 0;
+        break;
+      default:
+        return false;
     }
 
     switch (op) {
-      case '>': return actual > val;
-      case '<': return actual < val;
-      case '>=': return actual >= val;
-      case '<=': return actual <= val;
-      case '==': case '===': return actual === val;
-      default: return false;
+      case '>':
+        return actual > val;
+      case '<':
+        return actual < val;
+      case '>=':
+        return actual >= val;
+      case '<=':
+        return actual <= val;
+      case '==':
+      case '===':
+        return actual === val;
+      default:
+        return false;
     }
   }
 
@@ -182,25 +226,41 @@ function evaluateCondition(condition: string, ctx: RoutingContext): boolean {
 export function selectModel(ctx: RoutingContext): RoutingDecision {
   // Explicit task model override always wins
   if (ctx.taskModel) {
-    return { model: ctx.taskModel, complexity: 'heavy', reason: 'explicit-override' };
+    return {
+      model: ctx.taskModel,
+      complexity: 'heavy',
+      reason: 'explicit-override',
+    };
   }
 
   // Pinned groups always use the heavy model
   if (config.pinnedGroups.includes(ctx.groupFolder)) {
-    return { model: config.models.heavy, complexity: 'heavy', reason: 'pinned-group' };
+    return {
+      model: config.models.heavy,
+      complexity: 'heavy',
+      reason: 'pinned-group',
+    };
   }
 
   // Evaluate config-driven rules in order
   for (const rule of config.rules) {
     if (evaluateCondition(rule.condition, ctx)) {
       const complexity = rule.complexity as TaskComplexity;
-      return { model: config.models[complexity], complexity, reason: rule.reason };
+      return {
+        model: config.models[complexity],
+        complexity,
+        reason: rule.reason,
+      };
     }
   }
 
   // Default
   const defaultComplexity = config.defaultComplexity;
-  return { model: config.models[defaultComplexity], complexity: defaultComplexity, reason: 'default' };
+  return {
+    model: config.models[defaultComplexity],
+    complexity: defaultComplexity,
+    reason: 'default',
+  };
 }
 
 // ============================================================================
@@ -217,7 +277,9 @@ const ESCALATION_MAP: Record<TaskComplexity, TaskComplexity | null> = {
  * Escalate to the next tier when current tier produces a poor result.
  * Returns null if already at max tier.
  */
-export function escalateModel(currentComplexity: TaskComplexity): RoutingDecision | null {
+export function escalateModel(
+  currentComplexity: TaskComplexity,
+): RoutingDecision | null {
   const next = ESCALATION_MAP[currentComplexity];
   if (!next) return null;
 
@@ -246,7 +308,9 @@ export function shouldEscalate(
 // Logging Helpers
 // ============================================================================
 
-function getPromptLengthBucket(length: number): RoutingLog['promptLengthBucket'] {
+function getPromptLengthBucket(
+  length: number,
+): RoutingLog['promptLengthBucket'] {
   if (length < 1000) return '<1k';
   if (length < 10000) return '1k-10k';
   if (length < 50000) return '10k-50k';
