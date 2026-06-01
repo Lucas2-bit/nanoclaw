@@ -172,8 +172,14 @@ describe('silent-death-detector outbound alert text (allergen-screener lock)', (
     // Defensive cases: reasons that include numbers and the literal phrase
     // SAFETY_BLOCK still must not trip the screener.
     const cases = [
-      buildSilentDeathAlertText('silent-death', '99 prompts, 0 successful runs in 60m'),
-      buildSilentDeathAlertText('safety-block-loop', '12 SAFETY_BLOCK-missing events in 5m'),
+      buildSilentDeathAlertText(
+        'silent-death',
+        '99 prompts, 0 successful runs in 60m',
+      ),
+      buildSilentDeathAlertText(
+        'safety-block-loop',
+        '12 SAFETY_BLOCK-missing events in 5m',
+      ),
     ];
     for (const t of cases) {
       expect(screenOutbound(t).action).toBe('pass');
@@ -232,9 +238,7 @@ describe('startSilentDeathDetector wiring', () => {
 
     expect(fs.existsSync(ALERTS_DIR)).toBe(true);
     const files = fs.readdirSync(ALERTS_DIR);
-    const silentDeathFiles = files.filter((f) =>
-      f.startsWith('silent-death-'),
-    );
+    const silentDeathFiles = files.filter((f) => f.startsWith('silent-death-'));
     expect(silentDeathFiles.length).toBeGreaterThanOrEqual(1);
     const body = fs.readFileSync(
       path.join(ALERTS_DIR, silentDeathFiles[0]),
