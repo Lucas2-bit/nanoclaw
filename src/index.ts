@@ -623,32 +623,40 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
         logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
         if (text) {
+          let delivered = false;
           try {
-            await channel.sendMessage(activeChatJid, text);
+            delivered = await channel.sendMessage(activeChatJid, text);
           } catch (err) {
             recordSendFailure(activeChatJid, text, group.folder, err);
             throw err; // re-throw so the caller still sees the error
           }
-          outputSentToUser = true;
-          // Persist cursor now that output was confirmed sent to user
-          saveState();
+          // Only advance cursor + fire TTS follow-up when the user actually
+          // received the text. A HELD/suppressed send (allergen backstop,
+          // dedupe, queued-while-disconnected) returns false; treating it
+          // as success would drop the next inbound and TTS-speak text the
+          // user never saw.
+          if (delivered) {
+            outputSentToUser = true;
+            // Persist cursor now that output was confirmed sent to user
+            saveState();
 
-          // Voice response: if input had voice messages and channel supports it, send TTS
-          if (hasVoiceInput && channel.sendVoiceNote && group.voiceEnabled) {
-            try {
-              const audioBuffer = await generateSpeech(text);
-              if (audioBuffer) {
-                await channel.sendVoiceNote(activeChatJid, audioBuffer);
-                logger.info(
-                  { group: group.name, bytes: audioBuffer.length },
-                  'Voice note response sent',
+            // Voice response: if input had voice messages and channel supports it, send TTS
+            if (hasVoiceInput && channel.sendVoiceNote && group.voiceEnabled) {
+              try {
+                const audioBuffer = await generateSpeech(text);
+                if (audioBuffer) {
+                  await channel.sendVoiceNote(activeChatJid, audioBuffer);
+                  logger.info(
+                    { group: group.name, bytes: audioBuffer.length },
+                    'Voice note response sent',
+                  );
+                }
+              } catch (ttsErr) {
+                logger.warn(
+                  { err: ttsErr },
+                  'TTS voice response failed - text was sent',
                 );
               }
-            } catch (ttsErr) {
-              logger.warn(
-                { err: ttsErr },
-                'TTS voice response failed - text was sent',
-              );
             }
           }
         }
@@ -1207,10 +1215,12 @@ async function main(): Promise<void> {
     sendMessage: async (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      await channel.sendMessage(jid, text);
+      const delivered = await channel.sendMessage(jid, text);
 
-      // TTS: if recent conversation had voice input, also send a voice note
-      if (channel.sendVoiceNote) {
+      // TTS: only follow up with a voice note if the user actually saw
+      // the text. A HELD send returns false; speaking the suppressed text
+      // would leak it through audio (C-1).
+      if (delivered && channel.sendVoiceNote) {
         try {
           const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
           const recentMsgs = getMessagesSince(jid, fiveMinAgo, '__bot__', 20);

@@ -22,6 +22,7 @@ import {
 import { getLastGroupSync, setLastGroupSync, updateChatName } from '../db.js';
 import { isImageMessage, processImage } from '../image.js';
 import { logger } from '../logger.js';
+import { guardedOutbound } from '../safety/outbound-guard.js';
 import { isVoiceMessage, transcribeAudioMessage } from '../transcription.js';
 import {
   Channel,
@@ -331,7 +332,7 @@ export class WhatsAppChannel implements Channel {
     }
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(jid: string, text: string): Promise<boolean> {
     // Prefix bot messages with assistant name so users know who's speaking.
     // On a shared number, prefix is also needed in DMs (including self-chat)
     // to distinguish bot output from user messages.
@@ -340,8 +341,10 @@ export class WhatsAppChannel implements Channel {
       ? text
       : `${ASSISTANT_NAME}: ${text}`;
 
-    // Deduplicate: skip if same message was sent to same JID in last 60s
-    if (this.isDuplicate(jid, prefixed)) return;
+    // Deduplicate: skip if same message was sent to same JID in last 60s.
+    // The user did NOT receive a fresh send here — return false so callers
+    // don't double-advance cursors or fire follow-ups (e.g. voice note).
+    if (this.isDuplicate(jid, prefixed)) return false;
 
     if (!this.connected) {
       // Check queue for existing identical message before adding
@@ -350,19 +353,26 @@ export class WhatsAppChannel implements Channel {
       );
       if (alreadyQueued) {
         logger.info({ jid }, 'Message already in queue, skipping duplicate');
-        return;
+        return false;
       }
       this.outgoingQueue.push({ jid, text: prefixed });
       logger.info(
         { jid, length: prefixed.length, queueSize: this.outgoingQueue.length },
         'WA disconnected, message queued',
       );
-      return;
+      return false;
     }
     try {
-      await this.sock.sendMessage(jid, { text: prefixed });
-      this.markSent(jid, prefixed);
-      logger.info({ jid, length: prefixed.length }, 'Message sent');
+      return await guardedOutbound(
+        jid,
+        prefixed,
+        async () => {
+          await this.sock.sendMessage(jid, { text: prefixed });
+          this.markSent(jid, prefixed);
+          logger.info({ jid, length: prefixed.length }, 'Message sent');
+        },
+        { channel: 'whatsapp', medium: 'text' },
+      );
     } catch (err) {
       // If send fails, queue it for retry on reconnect
       this.outgoingQueue.push({ jid, text: prefixed });
@@ -370,6 +380,7 @@ export class WhatsAppChannel implements Channel {
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send, message queued',
       );
+      return false;
     }
   }
 
@@ -522,13 +533,29 @@ export class WhatsAppChannel implements Channel {
         const item = this.outgoingQueue.shift()!;
         // Skip if already sent recently (e.g. by another code path)
         if (this.isDuplicate(item.jid, item.text)) continue;
-        // Send directly — queued items are already prefixed by sendMessage
-        await this.sock.sendMessage(item.jid, { text: item.text });
-        this.markSent(item.jid, item.text);
-        logger.info(
-          { jid: item.jid, length: item.text.length },
-          'Queued message sent',
+        // Send directly — queued items are already prefixed by sendMessage.
+        // Bypasses sendMessage(), so we re-apply the outbound safety guard here.
+        // Drop on HOLD: the guard already wrote an alert and logged
+        // SAFETY-CRITICAL; re-queueing would replay it forever.
+        const delivered = await guardedOutbound(
+          item.jid,
+          item.text,
+          async () => {
+            await this.sock.sendMessage(item.jid, { text: item.text });
+            this.markSent(item.jid, item.text);
+            logger.info(
+              { jid: item.jid, length: item.text.length },
+              'Queued message sent',
+            );
+          },
+          { channel: 'whatsapp', medium: 'text-drain' },
         );
+        if (!delivered) {
+          logger.info(
+            { jid: item.jid, length: item.text.length },
+            'Queued message HELD by guard — dropped (not requeued)',
+          );
+        }
       }
     } finally {
       this.flushing = false;

@@ -84,7 +84,15 @@ export interface TaskRunLog {
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  /**
+   * Send `text` to `jid`. Returns `true` when the message reached the
+   * underlying transport (PASS), and `false` when the outbound safety
+   * guard HELD/suppressed the send, when no-op skips fired (duplicate
+   * dedupe, queued-while-disconnected), or when the channel was not in
+   * a state to deliver. Callers gate user-observable side-effects
+   * (cursor advance, TTS voice-note follow-up, state-save) on `true`.
+   */
+  sendMessage(jid: string, text: string): Promise<boolean>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;

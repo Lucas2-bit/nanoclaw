@@ -11,6 +11,7 @@ vi.mock('./config.js', () => ({
   CONTAINER_IMAGE: 'nanoclaw-agent:latest',
   CONTAINER_MAX_OUTPUT_SIZE: 10485760,
   CONTAINER_TIMEOUT: 1800000, // 30min
+  CREDENTIAL_PROXY_PORT: 10254,
   DATA_DIR: '/tmp/nanoclaw-test-data',
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
   IDLE_TIMEOUT: 1800000, // 30min
@@ -53,6 +54,7 @@ vi.mock('./mount-security.js', () => ({
 
 // Mock container-runtime
 vi.mock('./container-runtime.js', () => ({
+  CONTAINER_HOST_GATEWAY: 'host.docker.internal',
   CONTAINER_RUNTIME_BIN: 'docker',
   hostGatewayArgs: () => [],
   readonlyMountArgs: (h: string, c: string) => ['-v', `${h}:${c}:ro`],
@@ -225,5 +227,122 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+});
+
+// --- SAFETY-CRITICAL: allergen SAFETY_BLOCK injection ---
+//
+// These tests assert the allergen backstop is wired through to every
+// container run. The host (runContainerAgent) injects SAFETY_BLOCK into the
+// JSON payload written to the container's stdin. The agent-runner pins it
+// FIRST in the system-prompt append. If SAFETY_BLOCK is ever empty, the host
+// must fail closed (no spawn, alert file, error result).
+
+function captureStdinPayload(
+  proc: ReturnType<typeof createFakeProcess>,
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    proc.stdin.on('data', (chunk: Buffer | string) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    proc.stdin.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+describe('container-runner SAFETY_BLOCK injection', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.doUnmock('./safety/allergens.js');
+  });
+
+  for (const isMain of [true, false]) {
+    it(`injects SAFETY_BLOCK into stdin payload (isMain=${isMain})`, async () => {
+      const stdinPromise = captureStdinPayload(fakeProc);
+
+      const resultPromise = runContainerAgent(
+        testGroup,
+        { ...testInput, isMain },
+        () => {},
+        vi.fn(async () => {}),
+      );
+
+      // Tear down the container cleanly so the promise resolves.
+      emitOutputMarker(fakeProc, {
+        status: 'success',
+        result: 'ok',
+        newSessionId: 'session-safety',
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      fakeProc.emit('close', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      await resultPromise;
+
+      const payload = (await stdinPromise) as {
+        safetyBlock?: string;
+        isMain: boolean;
+      };
+      expect(payload.isMain).toBe(isMain);
+      expect(typeof payload.safetyBlock).toBe('string');
+      // Canonical markers from src/safety/allergens.ts — assert the verbatim
+      // safety facts reach the container for both main and non-main runs.
+      expect(payload.safetyBlock).toContain('SAFETY-CRITICAL');
+      expect(payload.safetyBlock).toContain('CHILD ALLERGENS');
+      expect(payload.safetyBlock).toContain('Oliver');
+      expect(payload.safetyBlock).toContain('Alexander');
+      expect(payload.safetyBlock).toContain('sesame');
+      expect(payload.safetyBlock).toContain('G6PD');
+    });
+  }
+
+  it('fail-closed: empty SAFETY_BLOCK refuses spawn, writes alert, returns error', async () => {
+    // Reset module graph so the new mock is picked up by container-runner.
+    vi.resetModules();
+    vi.doMock('./safety/allergens.js', () => ({
+      SAFETY_BLOCK: '   ',
+    }));
+
+    const { runContainerAgent: failClosedRunner } = await import(
+      './container-runner.js'
+    );
+    const fsMod = (await import('fs')).default;
+    const writeFileSync = fsMod.writeFileSync as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    const cp = await import('child_process');
+    const spawn = cp.spawn as unknown as ReturnType<typeof vi.fn>;
+    // Snapshot pre-call counts so we can prove no new spawn happens.
+    const spawnCallsBefore = spawn.mock.calls.length;
+    writeFileSync.mockClear();
+
+    const result = await failClosedRunner(
+      testGroup,
+      { ...testInput, isMain: true },
+      () => {},
+      vi.fn(async () => {}),
+    );
+
+    expect(result.status).toBe('error');
+    expect(result.error).toMatch(/SAFETY-CRITICAL/);
+    // No container should have been spawned during this run.
+    expect(spawn.mock.calls.length).toBe(spawnCallsBefore);
+    // An alert file should have been written under DATA_DIR/alerts/safety-*.
+    const alertWrites = writeFileSync.mock.calls.filter(
+      (call: unknown[]) =>
+        typeof call[0] === 'string' &&
+        (call[0] as string).includes('/alerts/safety-'),
+    );
+    expect(alertWrites.length).toBeGreaterThan(0);
   });
 });

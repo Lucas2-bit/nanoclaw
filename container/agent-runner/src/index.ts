@@ -30,6 +30,10 @@ interface ContainerInput {
   assistantName?: string;
   imageAttachments?: Array<{ relativePath: string; mediaType: string }>;
   script?: string;
+  // SAFETY-CRITICAL: injected by the host (src/container-runner.ts). Must be
+  // present and non-empty for every run (main included), and pinned FIRST in
+  // the system-prompt append. Empty/missing -> fail closed in main().
+  safetyBlock?: string;
 }
 
 interface ImageContentBlock {
@@ -413,6 +417,16 @@ async function runQuery(
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
+  // SAFETY-CRITICAL: SAFETY_BLOCK is the canonical allergen backstop and MUST
+  // be the FIRST segment of the system-prompt append for ALL groups (main
+  // included). It is injected by the host (src/container-runner.ts) via
+  // containerInput.safetyBlock. The fail-closed guard at the top of main()
+  // already refused to start if it was missing/empty, so it is non-empty here.
+  // Order: [SAFETY_BLOCK first] then [globalClaudeMd if present] then preset.
+  const systemPromptAppend = globalClaudeMd
+    ? `${containerInput.safetyBlock}\n\n${globalClaudeMd}`
+    : containerInput.safetyBlock!;
+
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
   const extraDirs: string[] = [];
@@ -443,9 +457,7 @@ async function runQuery(
         additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
         resume: sessionId,
         resumeSessionAt: resumeAt,
-        systemPrompt: globalClaudeMd
-          ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-          : undefined,
+        systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend },
         allowedTools: [
           'Bash',
           'Read', 'Write', 'Edit', 'Glob', 'Grep',
@@ -608,6 +620,26 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // SAFETY-CRITICAL: refuse to invoke the model if the canonical allergen
+  // SAFETY_BLOCK is missing or empty. The host (src/container-runner.ts)
+  // already fails closed before spawning, but we double-check here so a
+  // hand-crafted or stale stdin payload can never sneak past the backstop.
+  // The composed system prompt MUST contain SAFETY_BLOCK as its first segment.
+  if (
+    typeof containerInput.safetyBlock !== 'string' ||
+    containerInput.safetyBlock.trim().length === 0
+  ) {
+    const errMsg =
+      'SAFETY-CRITICAL: SAFETY_BLOCK missing/empty in containerInput; refusing to invoke model';
+    log(errMsg);
+    writeOutput({
+      status: 'error',
+      result: null,
+      error: errMsg,
+    });
+    process.exit(1);
+  }
+
   // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
   // No real secrets exist in the container environment.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
@@ -652,7 +684,9 @@ async function main(): Promise<void> {
         options: {
           cwd: '/workspace/group',
           resume: sessionId,
-          systemPrompt: undefined,
+          // SAFETY-CRITICAL: even the /compact summarization path gets the
+          // SAFETY_BLOCK first. No model call may run without the backstop.
+          systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: containerInput.safetyBlock! },
           allowedTools: [],
           env: sdkEnv,
           permissionMode: 'bypassPermissions' as const,

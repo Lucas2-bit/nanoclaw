@@ -28,6 +28,7 @@ import {
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
+import { SAFETY_BLOCK } from './safety/allergens.js';
 import { RegisteredGroup } from './types.js';
 import {
   selectModel,
@@ -362,6 +363,26 @@ async function buildContainerArgs(
   return args;
 }
 
+/**
+ * SAFETY-CRITICAL: write a safety alert file for the alert-consumer to drain.
+ * Filename prefix `safety-` keeps it distinct from session-size / channel-health
+ * alerts. Body is plain utf-8 text, matching the format expected by
+ * `src/alert-consumer.ts`.
+ */
+function writeSafetyAlertFile(message: string): void {
+  try {
+    const alertDir = path.join(DATA_DIR, 'alerts');
+    fs.mkdirSync(alertDir, { recursive: true });
+    const filename = `safety-${Date.now()}.txt`;
+    fs.writeFileSync(path.join(alertDir, filename), message, 'utf-8');
+  } catch (err) {
+    logger.warn(
+      { err },
+      'container-runner: failed to write safety alert file',
+    );
+  }
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
@@ -369,6 +390,29 @@ export async function runContainerAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
+
+  // SAFETY-CRITICAL: SAFETY_BLOCK must be present and non-empty for EVERY
+  // container run (main included). It is pinned FIRST in the system prompt
+  // append on the agent-runner side. If it ever becomes empty here, refuse
+  // to spawn — fail closed rather than launching a model call without the
+  // allergen backstop. Source of truth: src/safety/allergens.ts.
+  const safetyBlock = SAFETY_BLOCK;
+  if (typeof safetyBlock !== 'string' || safetyBlock.trim().length === 0) {
+    const errMsg =
+      'SAFETY-CRITICAL: SAFETY_BLOCK is missing or empty; refusing to spawn agent container';
+    logger.error(
+      { group: group.name, isMain: input.isMain },
+      errMsg,
+    );
+    writeSafetyAlertFile(
+      `${new Date().toISOString()} ${errMsg} (group=${group.name}, isMain=${input.isMain})`,
+    );
+    return {
+      status: 'error',
+      result: null,
+      error: errMsg,
+    };
+  }
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
@@ -457,7 +501,9 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    container.stdin.write(JSON.stringify(input));
+    // SAFETY-CRITICAL: inject SAFETY_BLOCK into every container run. The
+    // agent-runner pins it as the FIRST segment of the system-prompt append.
+    container.stdin.write(JSON.stringify({ ...input, safetyBlock }));
     container.stdin.end();
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive

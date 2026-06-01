@@ -16,6 +16,7 @@ vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   ASSISTANT_HAS_OWN_NUMBER: false,
   GROUPS_DIR: '/tmp/test-groups',
+  DATA_DIR: '/tmp/nanoclaw-test-data',
 }));
 
 // Mock logger

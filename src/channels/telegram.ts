@@ -7,6 +7,7 @@ import { ASSISTANT_NAME, GROUPS_DIR, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { processImage } from '../image.js';
 import { logger } from '../logger.js';
+import { guardedOutbound } from '../safety/outbound-guard.js';
 import { transcribeWithWhisperCpp } from '../transcription.js';
 import { transcribeWithGroq } from '../voice-transcription.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -452,31 +453,39 @@ export class TelegramChannel implements Channel {
     });
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(jid: string, text: string): Promise<boolean> {
     if (!this.bot) {
       logger.warn('Telegram bot not initialized');
-      return;
+      return false;
     }
 
     try {
-      const numericId = jid.replace(/^tg:/, '');
+      return await guardedOutbound(
+        jid,
+        text,
+        async () => {
+          const numericId = jid.replace(/^tg:/, '');
 
-      // Telegram has a 4096 character limit per message — split if needed
-      const MAX_LENGTH = 4096;
-      if (text.length <= MAX_LENGTH) {
-        await sendTelegramMessage(this.bot.api, numericId, text);
-      } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await sendTelegramMessage(
-            this.bot.api,
-            numericId,
-            text.slice(i, i + MAX_LENGTH),
-          );
-        }
-      }
-      logger.info({ jid, length: text.length }, 'Telegram message sent');
+          // Telegram has a 4096 character limit per message — split if needed
+          const MAX_LENGTH = 4096;
+          if (text.length <= MAX_LENGTH) {
+            await sendTelegramMessage(this.bot!.api, numericId, text);
+          } else {
+            for (let i = 0; i < text.length; i += MAX_LENGTH) {
+              await sendTelegramMessage(
+                this.bot!.api,
+                numericId,
+                text.slice(i, i + MAX_LENGTH),
+              );
+            }
+          }
+          logger.info({ jid, length: text.length }, 'Telegram message sent');
+        },
+        { channel: 'telegram', medium: 'text' },
+      );
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram message');
+      return false;
     }
   }
 

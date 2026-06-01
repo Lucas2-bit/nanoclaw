@@ -7,6 +7,7 @@ import { OAuth2Client } from 'google-auth-library';
 
 // isMain flag is used instead of MAIN_GROUP_FOLDER constant
 import { logger } from '../logger.js';
+import { guardedOutbound } from '../safety/outbound-guard.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -120,10 +121,10 @@ export class GmailChannel implements Channel {
     schedulePoll();
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(jid: string, text: string): Promise<boolean> {
     if (!this.gmail) {
       logger.warn('Gmail not initialized');
-      return;
+      return false;
     }
 
     const threadId = jid.replace(/^gmail:/, '');
@@ -131,12 +132,15 @@ export class GmailChannel implements Channel {
 
     if (!meta) {
       logger.warn({ jid }, 'No thread metadata for reply, cannot send');
-      return;
+      return false;
     }
 
     const subject = meta.subject.startsWith('Re:')
       ? meta.subject
       : `Re: ${meta.subject}`;
+
+    // Screen subject + body together so an allergen in either holds the send.
+    const screened = `${subject}\n${text}`;
 
     const headers = [
       `To: ${meta.sender}`,
@@ -156,16 +160,24 @@ export class GmailChannel implements Channel {
       .replace(/=+$/, '');
 
     try {
-      await this.gmail.users.messages.send({
-        userId: 'me',
-        requestBody: {
-          raw: encodedMessage,
-          threadId,
+      return await guardedOutbound(
+        jid,
+        screened,
+        async () => {
+          await this.gmail!.users.messages.send({
+            userId: 'me',
+            requestBody: {
+              raw: encodedMessage,
+              threadId,
+            },
+          });
+          logger.info({ to: meta.sender, threadId }, 'Gmail reply sent');
         },
-      });
-      logger.info({ to: meta.sender, threadId }, 'Gmail reply sent');
+        { channel: 'gmail', medium: 'subject+body' },
+      );
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Gmail reply');
+      return false;
     }
   }
 

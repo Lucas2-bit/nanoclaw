@@ -35,7 +35,7 @@ export interface AgentResult {
 
 /** Dependencies injected by the orchestrator. */
 export interface SessionCommandDeps {
-  sendMessage: (text: string) => Promise<void>;
+  sendMessage: (text: string) => Promise<boolean>;
   setTyping: (typing: boolean) => Promise<void>;
   runAgent: (
     prompt: string,
