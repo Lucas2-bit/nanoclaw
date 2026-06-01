@@ -25,6 +25,16 @@ const RESTART_SPIKE_THRESHOLD = 5;
 const LOG_FILE = NANOCLAW_DIR + '/logs/watchdog.log';
 const OLLAMA_URL = 'http://localhost:11434';
 
+// Live sink for nanoclaw stdout is pm2's per-process out-log, NOT
+// logs/nanoclaw.log (the old file-based log that the app no longer
+// writes — see checkPm2() / pm_out_log_path). Prefer the path returned
+// by `pm2 jlist` at runtime so this survives a `pm2 set` log relocation.
+// Fallback constant matches the default PM2_HOME layout.
+const PM2_OUT_LOG_FALLBACK =
+  process.env.NANOCLAW_PM2_OUT_LOG ||
+  (process.env.PM2_HOME || process.env.HOME + '/.pm2') +
+    '/logs/nanoclaw-out.log';
+
 let lastRestartCount = null;
 let consecutiveFailures = 0;
 
@@ -56,20 +66,21 @@ function checkPort() {
 
 function checkPm2() {
   const raw = run('pm2 jlist');
-  if (!raw) return { found: false, status: 'unknown', restarts: 0, pid: null };
+  if (!raw) return { found: false, status: 'unknown', restarts: 0, pid: null, outLog: PM2_OUT_LOG_FALLBACK };
   try {
     const procs = JSON.parse(raw);
     const nc = procs.find(p => p.name === PM2_PROCESS_NAME);
-    if (!nc) return { found: false, status: 'missing', restarts: 0, pid: null };
+    if (!nc) return { found: false, status: 'missing', restarts: 0, pid: null, outLog: PM2_OUT_LOG_FALLBACK };
     return {
       found: true,
       status: nc.pm2_env.status,
       restarts: nc.pm2_env.restart_time || 0,
       pid: nc.pid,
       memory: nc.monit ? nc.monit.memory : null,
-      uptime: nc.pm2_env.pm_uptime ? Date.now() - nc.pm2_env.pm_uptime : null
+      uptime: nc.pm2_env.pm_uptime ? Date.now() - nc.pm2_env.pm_uptime : null,
+      outLog: nc.pm2_env.pm_out_log_path || PM2_OUT_LOG_FALLBACK
     };
-  } catch (e) { return { found: false, status: 'parse_error', restarts: 0, pid: null }; }
+  } catch (e) { return { found: false, status: 'parse_error', restarts: 0, pid: null, outLog: PM2_OUT_LOG_FALLBACK }; }
 }
 
 function checkSessionSizes() {
@@ -154,7 +165,10 @@ async function runChecks() {
     if (zombies.length > 0) {
       killZombieOnPort(); await new Promise(r => setTimeout(r, 5000));
     } else {
-      const logs = run(`tail -50 ${NANOCLAW_DIR}/logs/nanoclaw.log`);
+      // pm2's out-log is the only live stdout sink for nanoclaw; the old
+      // logs/nanoclaw.log file is a dead artifact and tailing it returned
+      // empty context to the Ollama prompt for the entire crash-loop branch.
+      const logs = run(`tail -50 ${pm2.outLog}`);
       const a = await askOllama(`NanoClaw crash-looping (${crash.delta} restarts/min). No port conflict. Logs:\n${logs}\nCause? 1-2 sentences.`);
       if (a) log('OLLAMA', a);
     }

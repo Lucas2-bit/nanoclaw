@@ -1,6 +1,22 @@
-import { describe, it, expect, vi } from 'vitest';
+import fs from 'fs';
+import path from 'path';
 
-vi.mock('./config.js', () => ({ DATA_DIR: '/tmp/nanoclaw-silent-death-test' }));
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Use a real per-process tmpdir so the wiring test below can read files
+// written by writeAlertFile, and so concurrent vitest workers don't share
+// a fixed path. The path is surfaced via process.env because vi.mock is
+// hoisted above all top-level statements.
+vi.mock('./config.js', async () => {
+  const fsMod = await import('fs');
+  const osMod = await import('os');
+  const pathMod = await import('path');
+  const dir = fsMod.mkdtempSync(
+    pathMod.join(osMod.tmpdir(), 'nanoclaw-silent-death-'),
+  );
+  process.env.NANOCLAW_SILENT_DEATH_TEST_TMP = dir;
+  return { DATA_DIR: dir };
+});
 
 vi.mock('./logger.js', () => ({
   logger: {
@@ -11,7 +27,13 @@ vi.mock('./logger.js', () => ({
   },
 }));
 
-import { createDetector } from './silent-death-detector.js';
+import {
+  buildSilentDeathAlertText,
+  createDetector,
+  recordPromptStarted,
+  startSilentDeathDetector,
+} from './silent-death-detector.js';
+import { screenOutbound } from './safety/allergens.js';
 
 const WINDOW_MS = 15 * 60 * 1000;
 
@@ -117,5 +139,109 @@ describe('silent-death-detector evaluate()', () => {
     const r = d.evaluate();
     expect(r.safetyBlockMisses).toBe(0);
     expect(r.alarm).toBe(false);
+  });
+});
+
+// ----------------------------------------------------------------------------
+// Lock: the outbound alert text MUST pass the real allergen screener.
+// Regression for the lock comment on buildSilentDeathAlertText. If a future
+// change introduces an allergen + affirmative token into the alert, this test
+// fails before it can reach production — where the screener would page Lucas
+// (current ALERT-AND-PASS) or silently drop the alert (historical regime).
+// ----------------------------------------------------------------------------
+describe('silent-death-detector outbound alert text (allergen-screener lock)', () => {
+  it("real screenOutbound returns 'pass' for the silent-death variant", () => {
+    const text = buildSilentDeathAlertText(
+      'silent-death',
+      '3 prompts, 0 successful runs in 15m',
+    );
+    const verdict = screenOutbound(text);
+    expect(verdict.action).toBe('pass');
+  });
+
+  it("real screenOutbound returns 'pass' for the safety-block-loop variant", () => {
+    const text = buildSilentDeathAlertText(
+      'safety-block-loop',
+      '5 SAFETY_BLOCK-missing events in 15m',
+    );
+    const verdict = screenOutbound(text);
+    expect(verdict.action).toBe('pass');
+  });
+
+  it("real screenOutbound returns 'pass' even with edge-case reason strings", () => {
+    // Defensive cases: reasons that include numbers and the literal phrase
+    // SAFETY_BLOCK still must not trip the screener.
+    const cases = [
+      buildSilentDeathAlertText('silent-death', '99 prompts, 0 successful runs in 60m'),
+      buildSilentDeathAlertText('safety-block-loop', '12 SAFETY_BLOCK-missing events in 5m'),
+    ];
+    for (const t of cases) {
+      expect(screenOutbound(t).action).toBe('pass');
+    }
+  });
+});
+
+// ----------------------------------------------------------------------------
+// Wiring: startSilentDeathDetector — verify the scheduled tick really
+// invokes notifyMain AND writes an alert file when the singleton detector
+// hits the silent-death threshold. The pure-logic tests above use
+// createDetector, so this is the first test exercising the singleton path.
+// Uses fake timers (vitest's clock substitution = injectable clock).
+// ----------------------------------------------------------------------------
+describe('startSilentDeathDetector wiring', () => {
+  const ALERTS_DIR = path.join(
+    process.env.NANOCLAW_SILENT_DEATH_TEST_TMP || '',
+    'alerts',
+  );
+
+  beforeEach(() => {
+    // Start fake time far enough past 0 that the detector's initial
+    // dedupe check (now - lastAlarmAt < windowMs, lastAlarmAt=0) reports
+    // "not in dedupe". Default windowMs = 15min, so use 16min.
+    vi.useFakeTimers({ now: 16 * 60 * 1000 });
+    if (fs.existsSync(ALERTS_DIR)) {
+      for (const f of fs.readdirSync(ALERTS_DIR)) {
+        const full = path.join(ALERTS_DIR, f);
+        if (fs.statSync(full).isFile()) fs.unlinkSync(full);
+      }
+    }
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('on silent-death threshold: tick invokes notifyMain and writes an alert file', async () => {
+    const notifyMain = vi.fn(async (_text: string) => {});
+
+    // 3 prompts, 0 successes → singleton evaluate() returns alarm=true.
+    recordPromptStarted();
+    recordPromptStarted();
+    recordPromptStarted();
+
+    const pollMs = 1_000;
+    startSilentDeathDetector(notifyMain, pollMs);
+
+    // First tick is deferred by pollMs. Advance and let microtasks flush.
+    await vi.advanceTimersByTimeAsync(pollMs);
+
+    expect(notifyMain).toHaveBeenCalledTimes(1);
+    const msg = notifyMain.mock.calls[0][0];
+    expect(msg).toContain('SILENT DEATH DETECTED');
+    expect(msg.startsWith('[ops] ')).toBe(true);
+
+    expect(fs.existsSync(ALERTS_DIR)).toBe(true);
+    const files = fs.readdirSync(ALERTS_DIR);
+    const silentDeathFiles = files.filter((f) =>
+      f.startsWith('silent-death-'),
+    );
+    expect(silentDeathFiles.length).toBeGreaterThanOrEqual(1);
+    const body = fs.readFileSync(
+      path.join(ALERTS_DIR, silentDeathFiles[0]),
+      'utf-8',
+    );
+    expect(body).toContain('SILENT DEATH DETECTED');
+    expect(body).toContain('prompts=3');
+    expect(body).toContain('successes=0');
   });
 });

@@ -46,6 +46,40 @@ const SAFETY_BLOCK_RE =
 
 export type AlarmKind = 'silent-death' | 'safety-block-loop' | null;
 
+// ============================================================================
+// LOCK: outbound alert text — DO NOT introduce allergen tokens here.
+// ----------------------------------------------------------------------------
+// The text returned by buildSilentDeathAlertText() is sent through the same
+// outbound path as user replies (notifyMain -> routeOutbound -> guardedOutbound
+// -> screenOutbound). The screener HOLDs any text that contains an allergen
+// term (egg / nut / amoxicillin / sesame / ...) AND an affirmative-context
+// token (give / eat / take / safe / fine / ok / try / serve / recipe / ...).
+//
+// In the current ALERT-AND-PASS regime a hold still delivers the message,
+// but ALSO fires an owner-flag push to Lucas — so an allergen-flavoured ops
+// alert produces a spurious "verify against the canonical list" page on
+// every silent-death tick (alarm noise on top of real alarm noise).
+//
+// More importantly, the historical behaviour was fail-closed: a held alert
+// was silently dropped. If we ever revert to that regime, this lock is the
+// difference between "operator sees the page" and the 9h silent outage on
+// 2026-05-31.
+//
+// The regression test in silent-death-detector.test.ts imports this builder
+// and asserts the real screener returns 'pass' for representative inputs.
+// If you change the text, run that test before committing.
+// ============================================================================
+export function buildSilentDeathAlertText(
+  kind: 'silent-death' | 'safety-block-loop',
+  reason: string,
+): string {
+  const headline =
+    kind === 'safety-block-loop'
+      ? `SILENT DEATH DETECTED (safety-block loop): ${reason}`
+      : `SILENT DEATH DETECTED: ${reason}`;
+  return `[ops] ${headline}. Inspect host dist/ and container logs; watchdog did not catch this.`;
+}
+
 export interface DetectorConfig {
   windowMs: number;
   promptThreshold: number;
@@ -208,8 +242,16 @@ export function startSilentDeathDetector(
     try {
       const result = detector.evaluate();
       if (result.alarm) {
-        const headline =
+        const kind: 'silent-death' | 'safety-block-loop' =
           result.kind === 'safety-block-loop'
+            ? 'safety-block-loop'
+            : 'silent-death';
+        // Single source of truth — see lock comment on buildSilentDeathAlertText.
+        const alertText = buildSilentDeathAlertText(kind, result.reason);
+        // Headline is the alertText minus the "[ops] " prefix and trailing
+        // remediation hint; reconstructed here only for the log record key.
+        const headline =
+          kind === 'safety-block-loop'
             ? `SILENT DEATH DETECTED (safety-block loop): ${result.reason}`
             : `SILENT DEATH DETECTED: ${result.reason}`;
         logger.error(
@@ -230,11 +272,7 @@ export function startSilentDeathDetector(
             `safetyBlockMisses=${result.safetyBlockMisses}`,
           ].join('\n'),
         );
-        // Plain operational text — no allergen terms, no affirmative
-        // context — so guardedOutbound's screener returns pass.
-        notifyMain(
-          `[ops] ${headline}. Inspect host dist/ and container logs; watchdog did not catch this.`,
-        ).catch((err) =>
+        notifyMain(alertText).catch((err) =>
           logger.warn({ err }, 'silent-death: notifyMain failed'),
         );
       }
