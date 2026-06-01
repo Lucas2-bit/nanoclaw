@@ -313,9 +313,8 @@ describe('container-runner SAFETY_BLOCK injection', () => {
       SAFETY_BLOCK: '   ',
     }));
 
-    const { runContainerAgent: failClosedRunner } = await import(
-      './container-runner.js'
-    );
+    const { runContainerAgent: failClosedRunner } =
+      await import('./container-runner.js');
     const fsMod = (await import('fs')).default;
     const writeFileSync = fsMod.writeFileSync as unknown as ReturnType<
       typeof vi.fn

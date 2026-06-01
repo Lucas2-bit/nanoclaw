@@ -197,9 +197,15 @@ vi.mock('grammy', () => {
   }> = [];
   class FakeBot {
     api = {
-      sendMessage: vi.fn(async (chatId: string | number, text: string, opts?: { parse_mode?: string }) => {
-        sentMessages.push({ chatId, text, parse_mode: opts?.parse_mode });
-      }),
+      sendMessage: vi.fn(
+        async (
+          chatId: string | number,
+          text: string,
+          opts?: { parse_mode?: string },
+        ) => {
+          sentMessages.push({ chatId, text, parse_mode: opts?.parse_mode });
+        },
+      ),
       sendVoice: vi.fn(),
       sendChatAction: vi.fn(),
       getFile: vi.fn(),
@@ -208,11 +214,10 @@ vi.mock('grammy', () => {
     command = vi.fn();
     on = vi.fn();
     catch = vi.fn();
-    start(opts: { onStart: (botInfo: { username: string; id: number }) => void }) {
-      setTimeout(
-        () => opts.onStart({ username: 'andy_ai_bot', id: 99 }),
-        0,
-      );
+    start(opts: {
+      onStart: (botInfo: { username: string; id: number }) => void;
+    }) {
+      setTimeout(() => opts.onStart({ username: 'andy_ai_bot', id: 99 }), 0);
     }
     stop = vi.fn();
   }

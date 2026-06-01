@@ -428,7 +428,9 @@ export function screenOutbound(text: string): {
     // override an affirmative in a later clause.
     let hasCautionary = false;
     outer: for (const c of CAUTIONARY_MARKERS) {
-      const markerTokens = normalize(c).split(' ').filter((t) => t.length > 0);
+      const markerTokens = normalize(c)
+        .split(' ')
+        .filter((t) => t.length > 0);
       if (markerTokens.length === 0) continue;
       for (let i = 0; i + markerTokens.length <= tokens.length; i++) {
         let hit = true;

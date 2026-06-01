@@ -128,7 +128,11 @@ describe('guardedOutbound', () => {
   it('alert file is written under DATA_DIR/alerts with a safety-outbound- prefix', async () => {
     // Same prefix and dir as other writers (channel-health, session-size),
     // so the alert-consumer drains it on the same pass.
-    await guardedOutbound('x@g.us', 'try the pesto', vi.fn(async () => {}));
+    await guardedOutbound(
+      'x@g.us',
+      'try the pesto',
+      vi.fn(async () => {}),
+    );
     const alerts = readAlerts();
     expect(alerts).toHaveLength(1);
     expect(alerts[0].name.startsWith('safety-outbound-')).toBe(true);

@@ -376,10 +376,7 @@ function writeSafetyAlertFile(message: string): void {
     const filename = `safety-${Date.now()}.txt`;
     fs.writeFileSync(path.join(alertDir, filename), message, 'utf-8');
   } catch (err) {
-    logger.warn(
-      { err },
-      'container-runner: failed to write safety alert file',
-    );
+    logger.warn({ err }, 'container-runner: failed to write safety alert file');
   }
 }
 
@@ -400,10 +397,7 @@ export async function runContainerAgent(
   if (typeof safetyBlock !== 'string' || safetyBlock.trim().length === 0) {
     const errMsg =
       'SAFETY-CRITICAL: SAFETY_BLOCK is missing or empty; refusing to spawn agent container';
-    logger.error(
-      { group: group.name, isMain: input.isMain },
-      errMsg,
-    );
+    logger.error({ group: group.name, isMain: input.isMain }, errMsg);
     writeSafetyAlertFile(
       `${new Date().toISOString()} ${errMsg} (group=${group.name}, isMain=${input.isMain})`,
     );
