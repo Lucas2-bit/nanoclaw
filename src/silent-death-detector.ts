@@ -41,7 +41,8 @@ const DEFAULT_EVAL_MS = parseInt(
 
 // String match catches both the host-side pre-spawn refuse and the
 // container-side fail-closed marker propagated through stderr tail.
-const SAFETY_BLOCK_RE = /SAFETY_BLOCK\b.*\b(missing|empty)|refusing to invoke model|refusing to spawn/i;
+const SAFETY_BLOCK_RE =
+  /SAFETY_BLOCK\b.*\b(missing|empty)|refusing to invoke model|refusing to spawn/i;
 
 export type AlarmKind = 'silent-death' | 'safety-block-loop' | null;
 
@@ -103,7 +104,10 @@ export function createDetector(config?: Partial<DetectorConfig>): Detector {
     safetyBlockMisses.push(cfg.now());
   }
   function observeError(errorMessage: string | undefined): void {
-    if (typeof errorMessage === 'string' && SAFETY_BLOCK_RE.test(errorMessage)) {
+    if (
+      typeof errorMessage === 'string' &&
+      SAFETY_BLOCK_RE.test(errorMessage)
+    ) {
       recordSafetyBlockMissing();
     }
   }

@@ -15,7 +15,10 @@ import { createDetector } from './silent-death-detector.js';
 
 const WINDOW_MS = 15 * 60 * 1000;
 
-function makeClock(start = 1_000_000): { now: () => number; advance: (ms: number) => void } {
+function makeClock(start = 1_000_000): {
+  now: () => number;
+  advance: (ms: number) => void;
+} {
   let t = start;
   return {
     now: () => t,
@@ -67,8 +70,12 @@ describe('silent-death-detector evaluate()', () => {
     const clock = makeClock();
     const d = createDetector({ windowMs: WINDOW_MS, now: clock.now });
     // Mix of host-side and container-side fail-closed phrasings — both must match.
-    d.observeError('SAFETY-CRITICAL: SAFETY_BLOCK is missing or empty; refusing to spawn agent container');
-    d.observeError('Container exited with code 1: ...SAFETY_BLOCK missing; refusing to invoke model');
+    d.observeError(
+      'SAFETY-CRITICAL: SAFETY_BLOCK is missing or empty; refusing to spawn agent container',
+    );
+    d.observeError(
+      'Container exited with code 1: ...SAFETY_BLOCK missing; refusing to invoke model',
+    );
     d.observeError('refusing to invoke model: SAFETY_BLOCK empty');
     const r = d.evaluate();
     expect(r.alarm).toBe(true);

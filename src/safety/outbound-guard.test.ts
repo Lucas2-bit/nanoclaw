@@ -126,11 +126,7 @@ describe('guardedOutbound', () => {
     });
     setOwnerPush(push);
 
-    await guardedOutbound(
-      'chat@g.us',
-      'Augmentin is fine for Oliver',
-      deliver,
-    );
+    await guardedOutbound('chat@g.us', 'Augmentin is fine for Oliver', deliver);
 
     expect(deliver).toHaveBeenCalledTimes(1);
     expect(push).toHaveBeenCalledTimes(1);
