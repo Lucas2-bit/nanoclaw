@@ -83,9 +83,16 @@ import {
 } from './session-commands.js';
 import { startChannelHealthMonitor } from './channel-health.js';
 import {
+  observeContainerError,
+  recordContainerSuccess,
+  recordPromptStarted,
+  startSilentDeathDetector,
+} from './silent-death-detector.js';
+import {
   recordSendFailure,
   startDeadLetterWorker,
 } from './dead-letter-worker.js';
+import { setOwnerPush } from './safety/outbound-guard.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { getSessionFileSize, startSessionMonitor } from './session-monitor.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
@@ -721,6 +728,9 @@ async function runAgent(
   imageAttachments: Array<{ relativePath: string; mediaType: string }>,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
+  // Count a prompt-start for the silent-death detector. Wrapped at the
+  // helper layer so a detector failure can never reach the message path.
+  recordPromptStarted();
   const isMain = group.isMain === true;
   let sessionId: string | undefined = sessions[group.folder];
 
@@ -823,6 +833,7 @@ async function runAgent(
     }
 
     if (output.status === 'error') {
+      observeContainerError(output.error);
       logger.error(
         { group: group.name, error: output.error },
         'Container agent error',
@@ -830,6 +841,7 @@ async function runAgent(
       return 'error';
     }
 
+    recordContainerSuccess();
     return 'success';
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
@@ -1186,6 +1198,21 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Wire owner-push for the outbound allergen guard. On HOLD, the guard
+  // calls this to send a separate visible flag to the main group (Lucas)
+  // IN ADDITION to delivering the original message. Plain allergen-free
+  // text so the guard's screener never holds the flag itself.
+  setOwnerPush(async (text) => {
+    const mainEntry = Object.entries(registeredGroups).find(
+      ([, g]) => g.isMain === true,
+    );
+    if (!mainEntry) {
+      logger.warn('outbound-guard: no main group; owner flag only logged');
+      return;
+    }
+    await routeOutbound(channels, mainEntry[0], text);
+  });
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
@@ -1363,6 +1390,26 @@ async function main(): Promise<void> {
 
   // Start channel health monitor (Fix 2 — silent disconnect detection)
   startChannelHealthMonitor(() => channels);
+
+  // Start silent-death detector: alarms when prompts arrive but zero
+  // container runs succeed within a rolling window. Uses the same
+  // main-channel notify path as the queue's hang-timeout alert; the
+  // outbound text is plain ops content (no allergen+affirmative) so
+  // guardedOutbound's screener passes.
+  startSilentDeathDetector(async (text) => {
+    const mainEntry = Object.entries(registeredGroups).find(
+      ([, g]) => g.isMain === true,
+    );
+    if (!mainEntry) {
+      logger.warn('silent-death: no main group; alarm only logged');
+      return;
+    }
+    try {
+      await routeOutbound(channels, mainEntry[0], text);
+    } catch (e) {
+      logger.error({ e }, 'silent-death: routeOutbound failed');
+    }
+  });
 
   // Start dead letter queue retry worker (Fix 4 — outbound message recovery)
   startDeadLetterWorker(async (jid, text) => {

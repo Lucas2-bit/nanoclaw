@@ -1,13 +1,14 @@
-// Narrow allergen backstop for ALL outbound text. Fail-closed: if the
-// underlying screener throws OR the screener returns 'hold', the deliver
-// thunk is NOT invoked — the send is suppressed, an alert is written to
-// DATA_DIR/alerts/ (drained by alert-consumer), and a warn line is logged.
+// Narrow allergen backstop for ALL outbound text. ALERT-AND-PASS:
+// the deliver thunk is ALWAYS invoked. When the screener returns 'hold'
+// (or throws), an alert is written to DATA_DIR/alerts/, a warn line is
+// logged, AND a separate visible flag is pushed to the owner (Lucas) via
+// the registered owner-push helper — but the original message still goes
+// out. Lucas is the primary check (see allergens.ts); this is human
+// awareness, not a suppression gate.
 //
-// This is a NARROW backstop, not the primary safety guarantee (see
-// allergens.ts). It MUST NOT recurse: the alert file write and the warn
-// log do not go back through any channel send. No owner ping is wired
-// from this module — surfacing held messages to a human is intentionally
-// left to the alert-consumer + log path.
+// It MUST NOT recurse: the alert file write, the warn log, and the owner
+// push use a short, allergen-free flag string so guardedOutbound's
+// screener never holds the flag itself.
 
 import fs from 'fs';
 import path from 'path';
@@ -18,9 +19,30 @@ import { screenOutbound } from './allergens.js';
 
 const ALERTS_DIR = path.join(DATA_DIR, 'alerts');
 
+// Fixed allergen-free flag text. Must stay free of allergen tokens and
+// affirmative-context tokens (see ALLERGEN_TERMS and AFFIRMATIVE_CONTEXT
+// in ./allergens.ts) so the screener cannot HOLD the flag itself.
+const OWNER_FLAG_TEXT =
+  'ALLERGEN FLAG - the message above asserts something about a hard-exclude allergen or medication; verify against the canonical list before acting.';
+
 export interface GuardContext {
   channel?: string;
   medium?: string;
+}
+
+type OwnerPushFn = (text: string) => Promise<void>;
+
+let ownerPush: OwnerPushFn | null = null;
+
+/**
+ * Register the helper used to push a visible flag to the owner (Lucas)
+ * when the screener returns 'hold'. Called once at startup from
+ * src/index.ts. If never registered, hold paths still deliver the
+ * original message and still write the alert file — the owner push is
+ * just skipped (with a log line).
+ */
+export function setOwnerPush(fn: OwnerPushFn | null): void {
+  ownerPush = fn;
 }
 
 function writeHoldAlert(
@@ -28,6 +50,7 @@ function writeHoldAlert(
   text: string,
   matched: string[],
   reason: string,
+  notifiedOwner: boolean,
   ctx?: GuardContext,
 ): void {
   try {
@@ -42,15 +65,13 @@ function writeHoldAlert(
         matched,
         reason,
         text,
-        notifiedOwner: false,
+        notifiedOwner,
       },
       null,
       2,
     );
     fs.writeFileSync(path.join(ALERTS_DIR, filename), body, 'utf-8');
   } catch (err) {
-    // The write itself failing must never throw out of the guard — the
-    // send is still suppressed and the warn log below still fires.
     logger.warn(
       { err, jid, channel: ctx?.channel },
       'outbound-guard: failed to write hold alert file',
@@ -59,11 +80,12 @@ function writeHoldAlert(
 }
 
 /**
- * Run the allergen screener over `text`. If it returns 'pass', invoke
- * `deliver` and resolve `true` (delivered). If it returns 'hold' (or the
- * screener throws), suppress the send: write a structured alert into
- * DATA_DIR/alerts/, emit a SAFETY-CRITICAL warn log, and resolve `false`
- * so the caller can tell the message did not reach the user. Never throws.
+ * Run the allergen screener over `text` and ALWAYS invoke `deliver`.
+ * When the screener returns 'hold' (or throws), also write a structured
+ * alert into DATA_DIR/alerts/, emit a SAFETY warn log, AND push a
+ * separate visible flag to the owner via the registered owner-push
+ * helper — but the message still goes out. Returns `true` (delivered);
+ * the boolean is kept for caller-compatibility. Never throws.
  *
  * Callers pass the actual transport call as the `deliver` thunk so the
  * guard sits in front of every send.
@@ -78,34 +100,62 @@ export async function guardedOutbound(
   try {
     verdict = screenOutbound(text);
   } catch (err) {
-    // Fail-closed: any unexpected screener failure is treated as HOLD.
     logger.warn(
       { err, jid, channel: ctx?.channel },
-      'outbound-guard: screenOutbound threw — treating as HOLD',
+      'outbound-guard: screenOutbound threw — alerting and passing through',
     );
     verdict = {
       action: 'hold',
       matched: [],
-      reason: 'screenOutbound exception — defaulting to HOLD',
+      reason: 'screenOutbound exception',
     };
   }
 
-  if (verdict.action === 'pass') {
-    await deliver();
-    return true;
+  if (verdict.action === 'hold') {
+    logger.warn(
+      {
+        jid,
+        channel: ctx?.channel,
+        medium: ctx?.medium,
+        matched: verdict.matched,
+        reason: verdict.reason,
+        textLength: text.length,
+      },
+      'SAFETY: outbound flagged by allergen backstop — alerting, not suppressing',
+    );
+
+    // Primary signal: push a visible flag to the owner. Failure must
+    // never throw out of the guard — the file-alert below is the
+    // backup signal and the original message has already been queued
+    // for delivery below.
+    let notifiedOwner = false;
+    if (ownerPush) {
+      try {
+        await ownerPush(OWNER_FLAG_TEXT);
+        notifiedOwner = true;
+      } catch (err) {
+        logger.warn(
+          { err, jid, channel: ctx?.channel },
+          'outbound-guard: owner push failed — message still delivered, alert file still written',
+        );
+      }
+    } else {
+      logger.warn(
+        { jid, channel: ctx?.channel },
+        'outbound-guard: no ownerPush registered — only file alert + log',
+      );
+    }
+
+    writeHoldAlert(
+      jid,
+      text,
+      verdict.matched,
+      verdict.reason,
+      notifiedOwner,
+      ctx,
+    );
   }
 
-  writeHoldAlert(jid, text, verdict.matched, verdict.reason, ctx);
-  logger.warn(
-    {
-      jid,
-      channel: ctx?.channel,
-      medium: ctx?.medium,
-      matched: verdict.matched,
-      reason: verdict.reason,
-      textLength: text.length,
-    },
-    'SAFETY-CRITICAL: outbound HELD by allergen backstop — send suppressed',
-  );
-  return false;
+  await deliver();
+  return true;
 }

@@ -306,42 +306,45 @@ describe('container-runner SAFETY_BLOCK injection', () => {
     });
   }
 
-  it('fail-closed: empty SAFETY_BLOCK refuses spawn, writes alert, returns error', async () => {
-    // Reset module graph so the new mock is picked up by container-runner.
+  it('warn-and-spawn: empty SAFETY_BLOCK still spawns container (no fail-closed)', async () => {
+    // The earlier fail-closed gate caused a 9h silent outage when SAFETY_BLOCK
+    // import flapped. Contract is now: log a warning and spawn anyway —
+    // human-awareness backstop, not a hard gate.
     vi.resetModules();
     vi.doMock('./safety/allergens.js', () => ({
       SAFETY_BLOCK: '   ',
     }));
 
-    const { runContainerAgent: failClosedRunner } =
+    const { runContainerAgent: warnAndSpawnRunner } =
       await import('./container-runner.js');
-    const fsMod = (await import('fs')).default;
-    const writeFileSync = fsMod.writeFileSync as unknown as ReturnType<
-      typeof vi.fn
-    >;
     const cp = await import('child_process');
     const spawn = cp.spawn as unknown as ReturnType<typeof vi.fn>;
-    // Snapshot pre-call counts so we can prove no new spawn happens.
     const spawnCallsBefore = spawn.mock.calls.length;
-    writeFileSync.mockClear();
 
-    const result = await failClosedRunner(
+    const resultPromise = warnAndSpawnRunner(
       testGroup,
       { ...testInput, isMain: true },
       () => {},
       vi.fn(async () => {}),
     );
 
-    expect(result.status).toBe('error');
-    expect(result.error).toMatch(/SAFETY-CRITICAL/);
-    // No container should have been spawned during this run.
-    expect(spawn.mock.calls.length).toBe(spawnCallsBefore);
-    // An alert file should have been written under DATA_DIR/alerts/safety-*.
-    const alertWrites = writeFileSync.mock.calls.filter(
-      (call: unknown[]) =>
-        typeof call[0] === 'string' &&
-        (call[0] as string).includes('/alerts/safety-'),
-    );
-    expect(alertWrites.length).toBeGreaterThan(0);
+    // Tear the container down cleanly so the promise resolves.
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'ok',
+      newSessionId: 'session-warn-spawn',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+
+    // The host MUST have spawned the container despite the empty SAFETY_BLOCK.
+    expect(spawn.mock.calls.length).toBe(spawnCallsBefore + 1);
+    expect(result.status).toBe('success');
+    if (result.error) {
+      expect(result.error).not.toMatch(/refusing to spawn/i);
+    }
   });
 });

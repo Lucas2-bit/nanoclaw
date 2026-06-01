@@ -148,7 +148,7 @@ describe('WhatsAppChannel.sendMessage guard integration', () => {
     expect(countAlerts()).toBe(0);
   });
 
-  it('suppresses a held allergen message (Augmentin is fine for Oliver)', async () => {
+  it('delivers a held allergen message AND writes an alert (alert-and-pass)', async () => {
     const channel = new WhatsAppChannel({
       onMessage: vi.fn(),
       onChatMetadata: vi.fn(),
@@ -158,11 +158,16 @@ describe('WhatsAppChannel.sendMessage guard integration', () => {
 
     await channel.sendMessage('test@g.us', 'Augmentin is fine for Oliver');
 
-    expect(fakeSocket.sendMessage).not.toHaveBeenCalled();
+    // Original message MUST still be delivered (no suppression).
+    expect(fakeSocket.sendMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSocket.sendMessage).toHaveBeenCalledWith('test@g.us', {
+      text: 'Andy: Augmentin is fine for Oliver',
+    });
+    // Alert file still written for the human audit trail.
     expect(countAlerts()).toBe(1);
   });
 
-  it('drain path also screens — held queued messages are suppressed on flush', async () => {
+  it('drain path also alerts-and-passes — held queued messages still flush', async () => {
     const channel = new WhatsAppChannel({
       onMessage: vi.fn(),
       onChatMetadata: vi.fn(),
@@ -178,10 +183,13 @@ describe('WhatsAppChannel.sendMessage guard integration', () => {
     // Give the async flush a moment
     await new Promise((r) => setTimeout(r, 20));
 
-    // Only the safe one should have been delivered
-    expect(fakeSocket.sendMessage).toHaveBeenCalledTimes(1);
+    // Both should be delivered; the held one also produces an alert.
+    expect(fakeSocket.sendMessage).toHaveBeenCalledTimes(2);
     expect(fakeSocket.sendMessage).toHaveBeenCalledWith('test@g.us', {
       text: 'Andy: meeting at 3pm',
+    });
+    expect(fakeSocket.sendMessage).toHaveBeenCalledWith('test@g.us', {
+      text: 'Andy: Augmentin is fine for Oliver',
     });
     expect(countAlerts()).toBe(1);
   });
@@ -251,7 +259,7 @@ describe('TelegramChannel.sendMessage guard integration', () => {
     expect(countAlerts()).toBe(0);
   });
 
-  it('suppresses a held message', async () => {
+  it('delivers a held message AND writes an alert (alert-and-pass)', async () => {
     const channel = new TelegramChannel('tkn', {
       onMessage: vi.fn(),
       onChatMetadata: vi.fn(),
@@ -261,8 +269,10 @@ describe('TelegramChannel.sendMessage guard integration', () => {
 
     await channel.sendMessage('tg:42', 'Augmentin is fine for Oliver');
 
-    const sent = (grammyMod as unknown as { _sent: unknown[] })._sent;
-    expect(sent).toHaveLength(0);
+    const sent = (grammyMod as unknown as { _sent: Array<{ text: string }> })
+      ._sent;
+    expect(sent).toHaveLength(1);
+    expect(sent[0].text).toBe('Augmentin is fine for Oliver');
     expect(countAlerts()).toBe(1);
   });
 });

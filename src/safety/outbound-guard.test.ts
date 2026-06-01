@@ -34,7 +34,7 @@ vi.mock('./allergens.js', async () => {
   return { ...orig, screenOutbound: vi.fn(orig.screenOutbound) };
 });
 
-import { guardedOutbound } from './outbound-guard.js';
+import { guardedOutbound, setOwnerPush } from './outbound-guard.js';
 import { logger } from '../logger.js';
 import { screenOutbound } from './allergens.js';
 
@@ -69,6 +69,7 @@ describe('guardedOutbound', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    setOwnerPush(null);
   });
 
   it("calls deliver exactly once on 'pass' verdict", async () => {
@@ -78,8 +79,11 @@ describe('guardedOutbound', () => {
     expect(readAlerts()).toHaveLength(0);
   });
 
-  it("does NOT call deliver on 'hold' verdict; writes alert file and warns", async () => {
+  it("delivers the original message AND pushes owner flag on 'hold' verdict", async () => {
     const deliver = vi.fn(async () => {});
+    const push = vi.fn(async (_text: string) => {});
+    setOwnerPush(push);
+
     await guardedOutbound(
       'chat@g.us',
       'Augmentin is fine for Oliver',
@@ -87,7 +91,14 @@ describe('guardedOutbound', () => {
       { channel: 'whatsapp', medium: 'text' },
     );
 
-    expect(deliver).not.toHaveBeenCalled();
+    // Original message MUST be delivered (no suppression).
+    expect(deliver).toHaveBeenCalledTimes(1);
+
+    // Owner push MUST fire with the fixed allergen-free flag text.
+    expect(push).toHaveBeenCalledTimes(1);
+    const pushArg = push.mock.calls[0][0];
+    expect(pushArg).toMatch(/^ALLERGEN FLAG/);
+    expect(pushArg).toMatch(/verify against the canonical list/);
 
     const alerts = readAlerts();
     expect(alerts).toHaveLength(1);
@@ -99,25 +110,49 @@ describe('guardedOutbound', () => {
     expect(parsed.medium).toBe('text');
     expect(parsed.text).toBe('Augmentin is fine for Oliver');
     expect(parsed.matched).toContain('amoxicillin');
-    expect(parsed.notifiedOwner).toBe(false);
+    expect(parsed.notifiedOwner).toBe(true);
 
     expect(vi.mocked(logger.warn)).toHaveBeenCalled();
     const warnArgs = vi
       .mocked(logger.warn)
       .mock.calls.map((c) => String(c[c.length - 1]));
-    expect(warnArgs.some((m) => m.includes('SAFETY-CRITICAL'))).toBe(true);
+    expect(warnArgs.some((m) => m.includes('SAFETY:'))).toBe(true);
   });
 
-  it('treats screenOutbound exceptions as HOLD (fail-closed)', async () => {
+  it('delivers even when ownerPush throws; alert records notifiedOwner=false', async () => {
+    const deliver = vi.fn(async () => {});
+    const push = vi.fn(async (_text: string) => {
+      throw new Error('telegram down');
+    });
+    setOwnerPush(push);
+
+    await guardedOutbound(
+      'chat@g.us',
+      'Augmentin is fine for Oliver',
+      deliver,
+    );
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(push).toHaveBeenCalledTimes(1);
+    const alerts = readAlerts();
+    expect(alerts).toHaveLength(1);
+    const parsed = JSON.parse(alerts[0].body);
+    expect(parsed.notifiedOwner).toBe(false);
+  });
+
+  it('treats screenOutbound exceptions as HOLD but still delivers', async () => {
     const mocked = vi.mocked(screenOutbound);
     mocked.mockImplementationOnce(() => {
       throw new Error('boom');
     });
     const deliver = vi.fn(async () => {});
+    const push = vi.fn(async (_text: string) => {});
+    setOwnerPush(push);
 
     await guardedOutbound('chat@g.us', 'totally benign text', deliver);
 
-    expect(deliver).not.toHaveBeenCalled();
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(push).toHaveBeenCalledTimes(1);
     const alerts = readAlerts();
     expect(alerts).toHaveLength(1);
     const parsed = JSON.parse(alerts[0].body);
