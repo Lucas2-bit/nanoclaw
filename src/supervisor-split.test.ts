@@ -324,7 +324,7 @@ describe('MF4: restart cooldown + ceiling (N=2 / 15min)', () => {
 // D3 deny-list tests: mac-host-bridge approved commands
 // ---------------------------------------------------------------------------
 
-describe('D3 / INV-3: mac-host-bridge deny-list', () => {
+describe('D3 (shipped): agent keeps self-stop, gated by supervisor + 2-phase / INV-3: no supervisor-kill verbs', () => {
   // The mac-host-bridge config.py lives in the nanoclaw repo at this path.
   // Tests run on the host, so we read from the repo copy (not the container path).
   const CONFIG_PATH = path.resolve(
@@ -341,14 +341,12 @@ describe('D3 / INV-3: mac-host-bridge deny-list', () => {
     configSource = fs.readFileSync(CONFIG_PATH, 'utf-8');
   });
 
-  it('nanoclaw_stop is NOT an ApprovedCommand enum value (D3: agent cannot stop nanoclaw)', () => {
-    // Must not appear as an enum member value
-    expect(configSource).not.toMatch(/NANOCLAW_STOP\s*=\s*"nanoclaw_stop"/);
+  it('nanoclaw_stop IS an ApprovedCommand enum value (shipped design: agent keeps self-stop, Lucas 2026-06-02; safety via supervisor auto-revival + 2-phase gate)', () => {
+    expect(configSource).toMatch(/NANOCLAW_STOP\s*=\s*"nanoclaw_stop"/);
   });
 
-  it('nanoclaw_stop is NOT a key in _approved_commands dict (D3)', () => {
-    // The pm2 stop command must only appear under the operator key, not as nanoclaw_stop
-    expect(configSource).not.toMatch(/"nanoclaw_stop"\s*:/);
+  it('nanoclaw_stop IS a key in _approved_commands dict (self-stop lever retained)', () => {
+    expect(configSource).toMatch(/"nanoclaw_stop"\s*:/);
   });
 
   it('nanoclaw_restart IS an ApprovedCommand enum value (D3: agent self-restart lever preserved)', () => {
@@ -369,18 +367,16 @@ describe('D3 / INV-3: mac-host-bridge deny-list', () => {
     );
   });
 
-  it('operator stop path exists with concrete separate name (MF5: operator-vs-agent distinction)', () => {
-    expect(configSource).toMatch(
-      /NANOCLAW_OPERATOR_STOP\s*=\s*"nanoclaw_operator_stop"/,
-    );
-    expect(configSource).toMatch(/"nanoclaw_operator_stop"\s*:/);
+  it('no nanoclaw_operator_stop split shipped (capability+gate chosen over amputation, Lucas 2026-06-02); nanoclaw_restart lever present', () => {
+    expect(configSource).not.toMatch(/nanoclaw_operator_stop/);
+    expect(configSource).toMatch(/NANOCLAW_RESTART\s*=\s*"nanoclaw_restart"/);
   });
 
-  it('NO_ARGS_COMMANDS includes nanoclaw_operator_stop but NOT nanoclaw_stop', () => {
+  it('NO_ARGS_COMMANDS contains nanoclaw_restart and nanoclaw_stop (both agent levers kept)', () => {
     expect(configSource).toMatch(
-      /NO_ARGS_COMMANDS\s*=\s*\{[^}]*"nanoclaw_operator_stop"[^}]*\}/s,
+      /NO_ARGS_COMMANDS\s*=\s*\{[^}]*"nanoclaw_restart"[^}]*\}/s,
     );
-    expect(configSource).not.toMatch(
+    expect(configSource).toMatch(
       /NO_ARGS_COMMANDS\s*=\s*\{[^}]*"nanoclaw_stop"[^}]*\}/s,
     );
   });

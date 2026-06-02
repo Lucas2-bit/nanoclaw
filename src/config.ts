@@ -66,6 +66,29 @@ export const CLAUDE_TASK_PORT = parseInt(
   process.env.CLAUDE_TASK_PORT || '3002',
   10,
 );
+// Bounded FIFO queue depth for the :3002 claude-task bridge. A request that
+// arrives while one task runs is queued (not rejected) up to this many; only
+// a full queue yields 429 QUEUE_FULL. Concurrency stays 1 (one host CLI).
+export const CLAUDE_TASK_MAX_QUEUE = Math.max(
+  1,
+  parseInt(process.env.CLAUDE_TASK_MAX_QUEUE || '5', 10) || 5,
+);
+// Sync-sugar cap: POST /claude-task long-polls internally up to this long,
+// then hands back 202 {job_id, status:'running'}. Hard ceiling 30s — a held
+// socket during a self-reloading deploy is unsafe (no 290s long-poll).
+export const CLAUDE_TASK_SYNC_WAIT_MS = Math.max(
+  1000,
+  parseInt(process.env.CLAUDE_TASK_SYNC_WAIT_MS || '30000', 10) || 30000,
+);
+// Job-record retention: keep the most-recent N job files plus an age cap.
+export const CLAUDE_TASK_RETENTION_MAX = Math.max(
+  1,
+  parseInt(process.env.CLAUDE_TASK_RETENTION_MAX || '200', 10) || 200,
+);
+export const CLAUDE_TASK_RETENTION_AGE_MS = parseInt(
+  process.env.CLAUDE_TASK_RETENTION_AGE_MS || '604800000',
+  10,
+); // 7 days
 export const MAX_MESSAGES_PER_PROMPT = Math.max(
   1,
   parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10,
