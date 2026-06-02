@@ -184,7 +184,9 @@ describe('checkDistIntegrity', () => {
     fs.mkdirSync(path.join(root, 'src'), { recursive: true });
     fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'q;\n', 'utf-8');
     const r = checkDistIntegrity({ projectRoot: root });
-    expect(r.reasons.find((x) => x.code === 'src-newer-than-dist')).toBeTruthy();
+    expect(
+      r.reasons.find((x) => x.code === 'src-newer-than-dist'),
+    ).toBeTruthy();
     expect(r.ok).toBe(true);
   });
 

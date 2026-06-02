@@ -246,10 +246,7 @@ export function checkDistIntegrity(opts: CheckOptions = {}): IntegrityResult {
     // rebuild" without the hash mismatch (e.g. comments-only changes that
     // didn't change a compiled .js but did touch a .ts).
     try {
-      const srcDir = path.join(
-        opts.projectRoot ?? DEFAULT_PROJECT_ROOT,
-        'src',
-      );
+      const srcDir = path.join(opts.projectRoot ?? DEFAULT_PROJECT_ROOT, 'src');
       const srcTimes = walkMtimes(srcDir, '.ts');
       const distTimes = walkMtimes(distDir, '.js');
       if (srcTimes.length > 0 && distTimes.length > 0) {
