@@ -16,6 +16,7 @@ import makeWASocket, {
 import {
   ASSISTANT_HAS_OWN_NUMBER,
   ASSISTANT_NAME,
+  DATA_DIR,
   GROUPS_DIR,
   STORE_DIR,
 } from '../config.js';
@@ -33,6 +34,43 @@ import {
 import { registerChannel, ChannelOpts } from './registry.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// FIX 2 (MF2): when WhatsApp is logged out or needs QR re-auth, we write this
+// lock instead of exiting. A restart/respin cannot re-authenticate WhatsApp, so
+// the startup path refuses to spin a doomed client while the lock is present
+// (it pages via the supervisor signal and waits). The lock is cleared on a
+// successful connection. Out-of-band `/setup` (a separate process) performs the
+// actual QR scan and clears the lock by connecting successfully.
+const WHATSAPP_REAUTH_LOCK = path.join(DATA_DIR, 'whatsapp-reauth.lock');
+
+function writeReauthLock(reason: string): void {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(
+      WHATSAPP_REAUTH_LOCK,
+      JSON.stringify({ ts: Date.now(), reason }),
+    );
+  } catch {
+    /* non-fatal */
+  }
+}
+
+function clearReauthLock(): void {
+  try {
+    if (fs.existsSync(WHATSAPP_REAUTH_LOCK))
+      fs.unlinkSync(WHATSAPP_REAUTH_LOCK);
+  } catch {
+    /* non-fatal */
+  }
+}
+
+function reauthLockPresent(): boolean {
+  try {
+    return fs.existsSync(WHATSAPP_REAUTH_LOCK);
+  } catch {
+    return false;
+  }
+}
 
 export interface WhatsAppChannelOpts {
   onMessage: OnInboundMessage;
@@ -63,6 +101,22 @@ export class WhatsAppChannel implements Channel {
   }
 
   private async connectInternal(onFirstOpen?: () => void): Promise<void> {
+    // FIX 2 (MF2): if a re-auth lock is present, WhatsApp is logged out / needs
+    // a human QR scan. Spinning a client here would just hit the same logout and
+    // loop (pm2 would also respin us if we exited). Stay up, do NOT spin a doomed
+    // client; re-check periodically. The lock is cleared once `/setup` writes
+    // valid creds and a subsequent connection succeeds.
+    if (reauthLockPresent()) {
+      logger.warn(
+        'WhatsApp re-auth lock present — not starting client (needs human /setup). Will re-check in 60s.',
+      );
+      setTimeout(() => {
+        this.connectInternal(onFirstOpen).catch((err) => {
+          logger.error({ err }, 'WhatsApp re-auth re-check failed');
+        });
+      }, 60_000).unref?.();
+      return;
+    }
     const authDir = path.join(STORE_DIR, 'auth');
     fs.mkdirSync(authDir, { recursive: true });
 
@@ -97,7 +151,31 @@ export class WhatsAppChannel implements Channel {
         exec(
           `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
         );
-        setTimeout(() => process.exit(1), 1000);
+        // FIX 2 (MF2): QR re-auth is human-only. Write a re-auth lock and signal
+        // the supervisor to PAGE Lucas, but do NOT exit — exiting would let pm2
+        // autorestart us straight back into the same QR, an unbounded loop. We
+        // stay up and stop this doomed socket; the lock gates any reconnect.
+        writeReauthLock('whatsapp-qr-required');
+        const _sigPath = path.join(DATA_DIR, 'supervisor-signal.json');
+        try {
+          fs.mkdirSync(DATA_DIR, { recursive: true });
+          fs.writeFileSync(
+            _sigPath + '.tmp',
+            JSON.stringify({
+              ts: Date.now(),
+              reason: 'whatsapp-qr-required',
+              pid: process.pid,
+            }),
+          );
+          fs.renameSync(_sigPath + '.tmp', _sigPath);
+        } catch (_e) {
+          /* non-fatal */
+        }
+        try {
+          this.sock?.end(undefined);
+        } catch (_e) {
+          /* non-fatal */
+        }
       }
 
       if (connection === 'close') {
@@ -119,10 +197,33 @@ export class WhatsAppChannel implements Channel {
           this.scheduleReconnect(1);
         } else {
           logger.info('Logged out. Run /setup to re-authenticate.');
-          process.exit(0);
+          // FIX 2 (MF2): logout is human-only. Write a re-auth lock and signal the
+          // supervisor to PAGE Lucas, but do NOT exit and do NOT reconnect —
+          // exiting would let pm2 autorestart us into the same logout (a loop),
+          // and reconnecting cannot re-authenticate. Stay up; the lock gates any
+          // future client spin until /setup restores valid creds.
+          writeReauthLock('whatsapp-logged-out');
+          const _sigPath2 = path.join(DATA_DIR, 'supervisor-signal.json');
+          try {
+            fs.mkdirSync(DATA_DIR, { recursive: true });
+            fs.writeFileSync(
+              _sigPath2 + '.tmp',
+              JSON.stringify({
+                ts: Date.now(),
+                reason: 'whatsapp-logged-out',
+                pid: process.pid,
+              }),
+            );
+            fs.renameSync(_sigPath2 + '.tmp', _sigPath2);
+          } catch (_e) {
+            /* non-fatal */
+          }
         }
       } else if (connection === 'open') {
         this.connected = true;
+        // FIX 2 (MF2): a successful connection means auth is valid again — clear
+        // any re-auth lock so normal operation resumes.
+        clearReauthLock();
         logger.info('Connected to WhatsApp');
 
         // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)

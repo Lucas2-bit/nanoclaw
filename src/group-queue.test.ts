@@ -47,7 +47,7 @@ describe('GroupQueue', () => {
       // Simulate async work
       await new Promise((resolve) => setTimeout(resolve, 100));
       concurrentCount--;
-      return true;
+      return { ok: true, ranToCompletion: true };
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -75,7 +75,7 @@ describe('GroupQueue', () => {
       maxActive = Math.max(maxActive, activeCount);
       await new Promise<void>((resolve) => completionCallbacks.push(resolve));
       activeCount--;
-      return true;
+      return { ok: true, ranToCompletion: true };
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -113,7 +113,7 @@ describe('GroupQueue', () => {
         });
       }
       executionOrder.push('messages');
-      return true;
+      return { ok: true, ranToCompletion: true };
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -146,7 +146,7 @@ describe('GroupQueue', () => {
 
     const processMessages = vi.fn(async () => {
       callCount++;
-      return false; // failure
+      return { ok: false, ranToCompletion: false }; // failure
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -170,7 +170,10 @@ describe('GroupQueue', () => {
   // --- Shutdown prevents new enqueues ---
 
   it('prevents new enqueues after shutdown', async () => {
-    const processMessages = vi.fn(async () => true);
+    const processMessages = vi.fn(async () => ({
+      ok: true,
+      ranToCompletion: true,
+    }));
     queue.setProcessMessagesFn(processMessages);
 
     await queue.shutdown(1000);
@@ -188,7 +191,7 @@ describe('GroupQueue', () => {
 
     const processMessages = vi.fn(async () => {
       callCount++;
-      return false; // always fail
+      return { ok: false, ranToCompletion: false }; // always fail
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -221,7 +224,7 @@ describe('GroupQueue', () => {
     const processMessages = vi.fn(async (groupJid: string) => {
       processed.push(groupJid);
       await new Promise<void>((resolve) => completionCallbacks.push(resolve));
-      return true;
+      return { ok: true, ranToCompletion: true };
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -289,7 +292,7 @@ describe('GroupQueue', () => {
       await new Promise<void>((resolve) => {
         resolveProcess = resolve;
       });
-      return true;
+      return { ok: true, ranToCompletion: true };
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -329,7 +332,7 @@ describe('GroupQueue', () => {
       await new Promise<void>((resolve) => {
         resolveProcess = resolve;
       });
-      return true;
+      return { ok: true, ranToCompletion: true };
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -372,7 +375,7 @@ describe('GroupQueue', () => {
       await new Promise<void>((resolve) => {
         resolveProcess = resolve;
       });
-      return true;
+      return { ok: true, ranToCompletion: true };
     });
 
     queue.setProcessMessagesFn(processMessages);
@@ -442,7 +445,7 @@ describe('GroupQueue', () => {
       await new Promise<void>((resolve) => {
         resolveProcess = resolve;
       });
-      return true;
+      return { ok: true, ranToCompletion: true };
     });
 
     queue.setProcessMessagesFn(processMessages);

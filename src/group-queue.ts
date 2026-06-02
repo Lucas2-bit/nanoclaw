@@ -10,6 +10,11 @@ import {
 import { stopContainer } from './container-runtime.js';
 import { logger } from './logger.js';
 
+// Interval (ms) for the independent heartbeat tick written to queue-state.json.
+const QUEUE_STATE_TICK_INTERVAL_MS = 90_000;
+// Path to the out-of-process observable queue state file.
+const QUEUE_STATE_PATH = path.join(DATA_DIR, 'queue-state.json');
+
 interface QueuedTask {
   id: string;
   groupJid: string;
@@ -51,15 +56,42 @@ interface GroupState {
   halfOpenProbeDispatched: boolean;
 }
 
+/**
+ * Result of a processGroupMessages run.
+ * - ok: preserves the historical boolean meaning used for retry/circuit-breaker
+ *   logic (false => schedule retry; no-op returns are ok:true and do NOT retry).
+ * - ranToCompletion: true ONLY when a container actually spawned and delivered
+ *   output end-to-end. Drives the D1 zero-success alarm. No-op returns are false.
+ */
+export interface ProcessResult {
+  ok: boolean;
+  ranToCompletion: boolean;
+}
+
 export class GroupQueue {
   private groups = new Map<string, GroupState>();
   private activeCount = 0;
   private waitingGroups: string[] = [];
-  private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
-    null;
+  private processMessagesFn:
+    | ((groupJid: string) => Promise<ProcessResult>)
+    | null = null;
   private notifyMainFn?: (text: string) => Promise<void>;
   private requeueFn?: (groupJid: string) => void;
   private shuttingDown = false;
+  // Tracks the start time (ms) of the oldest currently-active run.
+  // null when activeCount === 0.
+  private oldestActiveStartedAt: number | null = null;
+  // Handle for the independent tick timer (written regardless of busy loop state).
+  private tickTimer: ReturnType<typeof setInterval> | null = null;
+  // Timestamp (ms) of the most recent successful container completion.
+  // Written to queue-state.json so the supervisor can detect the D1 alarm:
+  // zero successful completions in a rolling window despite active containers.
+  private lastSuccessAt: number | null = null;
+  // Timestamp (ms) of the most recent moment there was OUTSTANDING work:
+  // either a container was active OR a retry was scheduled. Lets the D1 alarm
+  // consider "had active work within the window" instead of sampling
+  // activeCount at a single instant (which can fall in a retry-backoff gap).
+  private lastActiveAt: number | null = null;
 
   /**
    * Folder-level locking: maps a folder name to the JID currently running a
@@ -119,6 +151,57 @@ export class GroupQueue {
     return state.circuitState;
   }
 
+  /** Return the current number of active containers (for external health checks). */
+  getActiveCount(): number {
+    return this.activeCount;
+  }
+
+  /**
+   * Atomically write queue state to QUEUE_STATE_PATH using temp-file + rename.
+   * Also updates the tick_ts field so the supervisor can detect heartbeat staleness
+   * independent of whether a write was triggered by a mutation or the tick timer.
+   */
+  private writeQueueState(): void {
+    const state = {
+      activeCount: this.activeCount,
+      oldestActiveStartedAt: this.oldestActiveStartedAt,
+      lastSuccessAt: this.lastSuccessAt,
+      lastActiveAt: this.lastActiveAt,
+      tick_ts: Date.now(),
+      ts: Date.now(),
+    };
+    const tmp = QUEUE_STATE_PATH + '.tmp';
+    try {
+      fs.mkdirSync(path.dirname(QUEUE_STATE_PATH), { recursive: true });
+      fs.writeFileSync(tmp, JSON.stringify(state));
+      fs.renameSync(tmp, QUEUE_STATE_PATH);
+    } catch (err) {
+      logger.warn({ err }, 'queue-state write failed (non-fatal)');
+    }
+  }
+
+  /**
+   * Start the independent heartbeat tick timer.
+   * This timer fires on its own interval — it is NOT driven by the busy loop,
+   * so supervisor can distinguish a healthy-idle process from a hung one.
+   * A stale tick_ts means the event loop is stalled.
+   */
+  startHeartbeatTick(): void {
+    if (this.tickTimer) return; // already started
+    this.tickTimer = setInterval(() => {
+      this.writeQueueState();
+    }, QUEUE_STATE_TICK_INTERVAL_MS);
+    // Allow process to exit even if timer is running (unref so it doesn't hold event loop)
+    if (
+      this.tickTimer &&
+      typeof (this.tickTimer as NodeJS.Timeout).unref === 'function'
+    ) {
+      (this.tickTimer as NodeJS.Timeout).unref();
+    }
+    // Write immediately on start
+    this.writeQueueState();
+  }
+
   /**
    * If the circuit is open and the reset timeout has elapsed, transition to
    * half-open so one probe message can get through.
@@ -135,7 +218,7 @@ export class GroupQueue {
     }
   }
 
-  setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
+  setProcessMessagesFn(fn: (groupJid: string) => Promise<ProcessResult>): void {
     this.processMessagesFn = fn;
   }
 
@@ -538,6 +621,15 @@ export class GroupQueue {
     state.pendingMessages = false;
     state.generation++;
     this.activeCount++;
+    // Outstanding work exists right now (a container is starting). Drives the
+    // D1 windowed active-work check so a retry-backoff gap cannot hide a dead
+    // system from the supervisor.
+    this.lastActiveAt = Date.now();
+    // Track oldest active run start time for supervisor 90-min backstop.
+    if (this.activeCount === 1) {
+      this.oldestActiveStartedAt = Date.now();
+    }
+    this.writeQueueState();
 
     // Acquire folder lock
     const folder = this.acquireFolderLock(groupJid);
@@ -562,8 +654,12 @@ export class GroupQueue {
         } else if (result.status === 'error') {
           throw result.error;
         } else {
-          const success = result.value;
-          if (success) {
+          // ok preserves the historical boolean: false => retry/circuit logic.
+          // ranToCompletion is true ONLY for a genuine end-to-end run that
+          // spawned a container and delivered output; no-op returns are false
+          // and must NOT refresh the D1 liveness signal (the 05-31 blind spot).
+          const { ok, ranToCompletion } = result.value;
+          if (ok) {
             // On success: reset retry count and close circuit if it was half-open
             if (state.circuitState === 'half-open') {
               state.circuitState = 'closed';
@@ -575,6 +671,12 @@ export class GroupQueue {
               );
             }
             state.retryCount = 0;
+            // Record successful completion for D1 alarm tracking ONLY when a
+            // real run completed end-to-end. No-op returns (no group, no
+            // missed messages, non-trigger) leave lastSuccessAt untouched.
+            if (ranToCompletion) {
+              this.lastSuccessAt = Date.now();
+            }
           } else {
             this.scheduleRetry(groupJid, state);
           }
@@ -589,6 +691,10 @@ export class GroupQueue {
       state.containerName = null;
       state.groupFolder = null;
       this.activeCount--;
+      if (this.activeCount === 0) {
+        this.oldestActiveStartedAt = null;
+      }
+      this.writeQueueState();
       // Release folder lock BEFORE draining so waiters can acquire it
       this.releaseFolderLock(folder, groupJid);
       this.drainGroup(groupJid);
@@ -602,6 +708,11 @@ export class GroupQueue {
     state.isTaskContainer = true;
     state.runningTaskId = task.id;
     this.activeCount++;
+    // Track oldest active run start time for supervisor 90-min backstop.
+    if (this.activeCount === 1) {
+      this.oldestActiveStartedAt = Date.now();
+    }
+    this.writeQueueState();
 
     // Acquire folder lock
     const folder = this.acquireFolderLock(groupJid);
@@ -629,6 +740,10 @@ export class GroupQueue {
       state.containerName = null;
       state.groupFolder = null;
       this.activeCount--;
+      if (this.activeCount === 0) {
+        this.oldestActiveStartedAt = null;
+      }
+      this.writeQueueState();
       // Release folder lock BEFORE draining so waiters can acquire it
       this.releaseFolderLock(folder, groupJid);
       this.drainGroup(groupJid);
@@ -637,6 +752,10 @@ export class GroupQueue {
 
   private scheduleRetry(groupJid: string, state: GroupState): void {
     state.retryCount++;
+    // A retry is outstanding work even though activeCount is momentarily 0
+    // during backoff. Refresh lastActiveAt so the D1 windowed check still sees
+    // the system as "working" across the backoff gap.
+    this.lastActiveAt = Date.now();
 
     // If we were in half-open and the probe failed, reopen the circuit immediately
     if (state.circuitState === 'half-open') {
@@ -766,6 +885,10 @@ export class GroupQueue {
 
   async shutdown(_gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
+    if (this.tickTimer) {
+      clearInterval(this.tickTimer);
+      this.tickTimer = null;
+    }
 
     // Count active containers but don't kill them — they'll finish on their own
     // via idle timeout or container timeout. The --rm flag cleans them up on exit.

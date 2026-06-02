@@ -20,9 +20,14 @@ import makeWASocket, {
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 
+import { DATA_DIR } from './config.js';
+
 const AUTH_DIR = './store/auth';
 const QR_FILE = './store/qr-data.txt';
 const STATUS_FILE = './store/auth-status.txt';
+// FIX 2 (MF2): byte-identical to whatsapp.ts WHATSAPP_REAUTH_LOCK so a
+// successful /setup re-auth clears the same lock the startup gate checks.
+const WHATSAPP_REAUTH_LOCK = path.join(DATA_DIR, 'whatsapp-reauth.lock');
 
 const logger = pino({
   level: 'warn', // Quiet logging - only show errors
@@ -138,6 +143,13 @@ async function connectSocket(
       // Clean up QR file now that we're connected
       try {
         fs.unlinkSync(QR_FILE);
+      } catch {}
+      // FIX 2 (MF2): clear the re-auth lock on successful /setup auth so the
+      // main process startup gate is no longer deadlocked (it never reaches
+      // connection==='open' itself while the lock is present).
+      try {
+        if (fs.existsSync(WHATSAPP_REAUTH_LOCK))
+          fs.unlinkSync(WHATSAPP_REAUTH_LOCK);
       } catch {}
       console.log('\n✓ Successfully authenticated with WhatsApp!');
       console.log('  Credentials saved to store/auth/');

@@ -43,9 +43,15 @@ vi.mock('fs', async () => {
     ...actual,
     default: {
       ...actual,
-      existsSync: vi.fn(() => true),
+      existsSync: vi.fn((p?: unknown) =>
+        typeof p === 'string' && p.endsWith('whatsapp-reauth.lock')
+          ? false
+          : true,
+      ),
       mkdirSync: vi.fn(),
       writeFileSync: vi.fn(),
+      renameSync: vi.fn(),
+      unlinkSync: vi.fn(),
     },
   };
 });
@@ -269,28 +275,34 @@ describe('WhatsAppChannel', () => {
   // --- QR code and auth ---
 
   describe('authentication', () => {
-    it('exits process when QR code is emitted (no auth state)', async () => {
+    it('on QR code: writes re-auth lock and does NOT exit (FIX 2: no pm2 respin loop)', async () => {
       vi.useFakeTimers();
       const mockExit = vi
         .spyOn(process, 'exit')
         .mockImplementation(() => undefined as never);
+      const fs = (await import('fs')).default;
+      const writeSpy = vi.mocked(fs.writeFileSync);
+      writeSpy.mockClear();
 
       const opts = createTestOpts();
       const channel = new WhatsAppChannel(opts);
 
-      // Start connect but don't await (it won't resolve - process exits)
       channel.connect().catch(() => {});
-
-      // Flush microtasks so connectInternal registers handlers
       await vi.advanceTimersByTimeAsync(0);
 
       // Emit QR code event
       fakeSocket._ev.emit('connection.update', { qr: 'some-qr-data' });
-
-      // Advance timer past the 1000ms setTimeout before exit
       await vi.advanceTimersByTimeAsync(1500);
 
-      expect(mockExit).toHaveBeenCalledWith(1);
+      // FIX 2: must NOT exit (exiting would let pm2 autorestart into the same QR).
+      expect(mockExit).not.toHaveBeenCalled();
+      // Must write the re-auth lock so the startup guard backs off the client.
+      const wroteReauthLock = writeSpy.mock.calls.some(
+        (c) =>
+          typeof c[0] === 'string' &&
+          (c[0] as string).endsWith('whatsapp-reauth.lock'),
+      );
+      expect(wroteReauthLock).toBe(true);
       mockExit.mockRestore();
       vi.useRealTimers();
     });
@@ -314,10 +326,13 @@ describe('WhatsAppChannel', () => {
       // The channel should attempt to reconnect (calls connectInternal again)
     });
 
-    it('exits on loggedOut disconnect', async () => {
+    it('on loggedOut disconnect: writes re-auth lock and does NOT exit (FIX 2: no pm2 respin loop)', async () => {
       const mockExit = vi
         .spyOn(process, 'exit')
         .mockImplementation(() => undefined as never);
+      const fs = (await import('fs')).default;
+      const writeSpy = vi.mocked(fs.writeFileSync);
+      writeSpy.mockClear();
 
       const opts = createTestOpts();
       const channel = new WhatsAppChannel(opts);
@@ -328,7 +343,14 @@ describe('WhatsAppChannel', () => {
       triggerDisconnect(401);
 
       expect(channel.isConnected()).toBe(false);
-      expect(mockExit).toHaveBeenCalledWith(0);
+      // FIX 2: must NOT exit (exiting would let pm2 autorestart into the same logout).
+      expect(mockExit).not.toHaveBeenCalled();
+      const wroteReauthLock = writeSpy.mock.calls.some(
+        (c) =>
+          typeof c[0] === 'string' &&
+          (c[0] as string).endsWith('whatsapp-reauth.lock'),
+      );
+      expect(wroteReauthLock).toBe(true);
       mockExit.mockRestore();
     });
 

@@ -1,5 +1,9 @@
 #!/bin/bash
-if ! /usr/sbin/lsof -i :3001 -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "$(date): NanoClaw down - restarting" >> /Users/lucascarroll/nanoclaw/logs/watchdog.log
-  /opt/homebrew/bin/pm2 restart nanoclaw >> /Users/lucascarroll/nanoclaw/logs/watchdog.log 2>&1
-fi
+# watchdog.sh — DEPRECATED / NEUTERED (2026-06-02, Supervisor Split keystone)
+#
+# This script previously ran pm2 restart nanoclaw. It has been neutered as
+# part of the MF1/D3 deny-self-lifecycle work.
+#
+# The active supervisor is watchdog-v2.cjs, managed by pm2 as the watchdog app.
+echo "[watchdog.sh] DEPRECATED: this script is neutered. The supervisor is watchdog-v2.cjs." >&2
+exit 1

@@ -58,6 +58,7 @@ import {
   unlinkJid,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
+import type { ProcessResult } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { startPactBridge } from './pact-bridge.js';
@@ -460,7 +461,7 @@ export function _setRegisteredGroups(
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
  */
-async function processGroupMessages(chatJid: string): Promise<boolean> {
+async function processGroupMessages(chatJid: string): Promise<ProcessResult> {
   // Resolve linked JIDs: chatJid may be a secondary that maps to a primary group
   const primaryJid = resolvePrimaryJid(chatJid);
   // Snapshot the run generation at entry — if it advances mid-run (timeout
@@ -468,7 +469,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // cursor because the timeout path now owns requeue.
   const myGen = queue.getGeneration(primaryJid);
   const group = registeredGroups[primaryJid];
-  if (!group) return true;
+  if (!group) return { ok: true, ranToCompletion: false };
 
   // Collect messages from the primary JID AND all linked secondary JIDs.
   // Messages are stored under their original JID, so we must check all of them.
@@ -510,12 +511,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const channel = activeChannel || findChannel(channels, chatJid);
   if (!channel) {
     logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
-    return true;
+    return { ok: true, ranToCompletion: false };
   }
 
   const isMainGroup = group.isMain === true;
 
-  if (missedMessages.length === 0) return true;
+  if (missedMessages.length === 0) return { ok: true, ranToCompletion: false };
 
   // --- Session command interception (before trigger check) ---
   const isPrivateChat = !isMainGroup && group.requiresTrigger === false;
@@ -560,7 +561,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       },
     },
   });
-  if (cmdResult.handled) return cmdResult.success;
+  if (cmdResult.handled)
+    return { ok: cmdResult.success, ranToCompletion: false };
   // --- End session command interception ---
 
   // For non-main groups, check if trigger is required and present
@@ -574,7 +576,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           isTriggerAllowed(activeChatJid, m.sender, allowlistCfg)),
     );
     if (!hasTrigger) {
-      return true;
+      return { ok: true, ranToCompletion: false };
     }
   }
 
@@ -695,14 +697,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         { group: group.name },
         'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
       );
-      return true;
+      // Output was delivered end-to-end before the error, so this counts as a
+      // genuine completion for the D1 alarm.
+      return { ok: true, ranToCompletion: true };
     }
     if (queue.getGeneration(primaryJid) !== myGen) {
       logger.info(
         { jid: primaryJid },
         'Run superseded by timeout/new run; skipping cursor rollback',
       );
-      return false;
+      return { ok: false, ranToCompletion: false };
     }
     // Roll back cursors for all linked JIDs so retries can re-process
     for (const jid of allJids) {
@@ -713,7 +717,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       { group: group.name },
       'Agent error, rolled back message cursor for retry',
     );
-    return false;
+    return { ok: false, ranToCompletion: false };
   }
 
   // Agent completed successfully. Persist cursor if not already saved.
@@ -721,7 +725,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     saveState();
   }
 
-  return true;
+  // Genuine end-to-end completion: a container spawned and delivered output.
+  return { ok: true, ranToCompletion: true };
 }
 
 async function runAgent(
@@ -1374,6 +1379,9 @@ async function main(): Promise<void> {
   });
   recoverPendingMessages();
 
+  // Start the independent heartbeat tick so the supervisor can detect event-loop hangs.
+  queue.startHeartbeatTick();
+
   // Start session file size monitor (Fix 1 — OOM prevention, with auto-compact)
   startSessionMonitor(
     () => registeredGroups,
@@ -1458,7 +1466,28 @@ async function main(): Promise<void> {
   });
 
   startMessageLoop().catch((err) => {
-    logger.fatal({ err }, 'Message loop crashed unexpectedly');
+    logger.fatal(
+      { err },
+      'Message loop crashed unexpectedly — writing supervisor signal for restart',
+    );
+    // MF1 class (a) neuter: write supervisor signal instead of silent exit.
+    // Supervisor reads this and issues a bounded restart + e2e probe.
+    // process.exit still fires as fallback if supervisor is unavailable.
+    const _sigPath = path.join(DATA_DIR, 'supervisor-signal.json');
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(
+        _sigPath + '.tmp',
+        JSON.stringify({
+          ts: Date.now(),
+          reason: 'message-loop-crash',
+          pid: process.pid,
+        }),
+      );
+      fs.renameSync(_sigPath + '.tmp', _sigPath);
+    } catch (_e) {
+      /* non-fatal */
+    }
     process.exit(1);
   });
 }
