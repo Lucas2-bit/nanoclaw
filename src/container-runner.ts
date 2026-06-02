@@ -29,6 +29,7 @@ import {
 import { detectAuthMode } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { SAFETY_BLOCK } from './safety/allergens.js';
+import { writeAlertFile } from './safety/alert-writer.js';
 import { RegisteredGroup } from './types.js';
 import {
   selectModel,
@@ -365,19 +366,11 @@ async function buildContainerArgs(
 
 /**
  * SAFETY-CRITICAL: write a safety alert file for the alert-consumer to drain.
- * Filename prefix `safety-` keeps it distinct from session-size / channel-health
- * alerts. Body is plain utf-8 text, matching the format expected by
- * `src/alert-consumer.ts`.
+ * Thin wrapper around the shared writer so prefix/dir/format stay consistent
+ * across safety, git-integrity, and any other producers.
  */
 function writeSafetyAlertFile(message: string): void {
-  try {
-    const alertDir = path.join(DATA_DIR, 'alerts');
-    fs.mkdirSync(alertDir, { recursive: true });
-    const filename = `safety-${Date.now()}.txt`;
-    fs.writeFileSync(path.join(alertDir, filename), message, 'utf-8');
-  } catch (err) {
-    logger.warn({ err }, 'container-runner: failed to write safety alert file');
-  }
+  writeAlertFile(message, 'safety');
 }
 
 export async function runContainerAgent(

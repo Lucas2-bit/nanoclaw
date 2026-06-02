@@ -1,1 +1,2 @@
 npm run format:fix
+node scripts/scan-secrets.cjs --staged

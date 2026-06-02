@@ -14,6 +14,9 @@ import {
 } from './config.js';
 import './channels/index.js';
 import { startAlertConsumer } from './alert-consumer.js';
+import { checkDistIntegrity, formatIntegrityMessage } from './integrity.js';
+import { recordHealth } from './health.js';
+import { writeAlertFile } from './safety/alert-writer.js';
 import {
   getChannelFactory,
   getRegisteredChannelNames,
@@ -1050,6 +1053,42 @@ async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
+
+  // Git-integrity check: non-blocking, advisory-or-drift only. We never gate
+  // `ready` on this — a drifted dist is degraded, not dead, and the alert
+  // path is enough to get attention without preventing boot.
+  try {
+    const integ = checkDistIntegrity();
+    recordHealth('distIntegrity', integ);
+    if (!integ.ok) {
+      logger.error({ reasons: integ.reasons }, 'dist integrity drift at boot');
+      writeAlertFile(formatIntegrityMessage(integ), 'git-integrity');
+    }
+    // Drop a "this process is alive on THIS sha" beacon for scripts/deploy.sh
+    // post-verify. The file's gitSha is what the live process actually loaded
+    // (via integrity.ts → dist/build-info.json), and the pid lets deploy.sh
+    // distinguish a successful re-exec from a stale carry-over. Best-effort:
+    // a failure here must never crash boot.
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(
+        path.join(DATA_DIR, 'running.json'),
+        JSON.stringify({
+          pid: process.pid,
+          gitSha: integ.details.buildSha ?? null,
+          headSha: integ.details.headSha ?? null,
+          builtAt: integ.details.builtAt ?? null,
+          startedAt: new Date().toISOString(),
+        }),
+        'utf-8',
+      );
+    } catch (e) {
+      logger.warn({ err: e }, 'failed to write running.json (non-fatal)');
+    }
+  } catch (e) {
+    logger.error({ err: e }, 'integrity check threw (ignored, non-blocking)');
+  }
+
   loadState();
   pruneStaleSessionIds();
   pruneOrphanSessionFiles();

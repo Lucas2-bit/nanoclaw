@@ -16,6 +16,7 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 function inferSource(filename: string): string {
   if (filename.startsWith('channel-health-')) return 'channel-health';
   if (filename.startsWith('session-size-')) return 'session-monitor';
+  if (filename.startsWith('git-integrity-')) return 'git-integrity';
   return 'unknown';
 }
 

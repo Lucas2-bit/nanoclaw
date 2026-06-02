@@ -81,7 +81,7 @@ Wait for the user to provide both tokens.
 Add to `.env`:
 
 ```bash
-SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_BOT_TOKEN=xoxb-your-bot-token  # secret-scan:allow
 SLACK_APP_TOKEN=xapp-your-app-token
 ```
 

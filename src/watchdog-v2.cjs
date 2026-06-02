@@ -16,11 +16,33 @@ const MAX_SELF_FAILURES = 3;
 const RESTART_SPIKE_THRESHOLD = 5;
 const RESTART_SPIKE_WINDOW_MIN = 10;
 
+// Git-integrity check is loaded from compiled dist/. If dist isn't built yet
+// (fresh checkout, mid-deploy) we emit one advisory and continue — the rest
+// of the watchdog must keep running.
+const DATA_DIR = path.join(__dirname, '..', 'data');
+const DATA_ALERTS_DIR = path.join(DATA_DIR, 'alerts');
+const DEPLOY_LOCK_PATH = path.join(DATA_DIR, '.deploy.lock');
+const INTEGRITY_ALERT_COOLDOWN_MS = 30 * 60_000;
+
+let integrityModule = null;
+let integrityLoadError = null;
+try {
+  integrityModule = require(path.join(__dirname, '..', 'dist', 'integrity.js'));
+} catch (e) {
+  integrityLoadError = e;
+}
+
 // --- State ---
 let selfFailures = 0;
 let currentInterval = CHECK_INTERVAL_MS;
 let lastRestartCount = null;
 let restartHistory = [];
+
+// Git-integrity dedup: only re-alert on (a) state transition between
+// ok<->drift or (b) the same drift persisting for >= 30 min. Key includes
+// reasonCodes + build sha + head sha so any meaningful change re-fires.
+let lastIntegrityState = { ok: null, key: null, lastAlertAt: 0 };
+let integrityModuleMissingAlerted = false;
 
 // --- Alert Levels ---
 const LEVEL = { INFO: 'INFO', WARN: 'WARN', CRITICAL: 'CRITICAL' };
@@ -60,6 +82,104 @@ function checkPort() {
   } catch {
     return { healthy: false, message: `Port ${PORT} not listening` };
   }
+}
+
+function writeIntegrityAlertFile(message) {
+  try {
+    fs.mkdirSync(DATA_ALERTS_DIR, { recursive: true });
+    const filename = `git-integrity-${Date.now()}.txt`;
+    fs.writeFileSync(path.join(DATA_ALERTS_DIR, filename), message, 'utf-8');
+  } catch (e) {
+    alert(LEVEL.WARN, 'git-integrity', `failed to write alert file: ${e.message}`);
+  }
+}
+
+function checkGitIntegrity() {
+  // One-shot advisory if the compiled module isn't available — keeps the
+  // rest of the watchdog functional.
+  if (!integrityModule) {
+    if (!integrityModuleMissingAlerted) {
+      integrityModuleMissingAlerted = true;
+      const msg = `integrity-module-missing: dist/integrity.js not loadable (${integrityLoadError && integrityLoadError.message})`;
+      alert(LEVEL.WARN, 'git-integrity', msg);
+      writeIntegrityAlertFile(msg);
+    }
+    return;
+  }
+
+  // Deploy in progress — a mid-deploy SHA divergence is expected, not a fault.
+  if (fs.existsSync(DEPLOY_LOCK_PATH)) {
+    return;
+  }
+
+  let result;
+  try {
+    result = integrityModule.checkDistIntegrity();
+  } catch (e) {
+    // checkDistIntegrity is documented to never throw, but defense in depth.
+    alert(LEVEL.WARN, 'git-integrity', `check threw (ignored): ${e.message}`);
+    return;
+  }
+
+  const reasonCodes = (result.reasons || [])
+    .map((r) => r.code)
+    .sort()
+    .join(',');
+  const buildSha = (result.details && result.details.buildSha) || '';
+  const headSha = (result.details && result.details.headSha) || '';
+  const key = `${reasonCodes}|${buildSha}|${headSha}`;
+
+  const now = Date.now();
+  const stateChanged = lastIntegrityState.ok !== result.ok;
+  const keyChanged = lastIntegrityState.key !== key;
+  const cooledDown =
+    now - lastIntegrityState.lastAlertAt >= INTEGRITY_ALERT_COOLDOWN_MS;
+
+  // Always fire on transition; otherwise only re-fire on drift if key
+  // changed OR cooldown elapsed.
+  let shouldAlert = false;
+  if (stateChanged) {
+    shouldAlert = true;
+  } else if (!result.ok && (keyChanged || cooledDown)) {
+    shouldAlert = true;
+  }
+
+  if (shouldAlert) {
+    const body = formatIntegrityMessage(result);
+    if (!result.ok) {
+      alert(LEVEL.CRITICAL, 'git-integrity', 'dist integrity drift', {
+        reasonCodes,
+        buildSha,
+        headSha,
+      });
+    } else {
+      // Transitioned back to ok — log INFO, no pickup file needed for green.
+      alert(LEVEL.INFO, 'git-integrity', 'dist integrity recovered', {
+        reasonCodes,
+      });
+    }
+    if (!result.ok) writeIntegrityAlertFile(body);
+    lastIntegrityState = { ok: result.ok, key, lastAlertAt: now };
+  } else {
+    lastIntegrityState.ok = result.ok;
+    lastIntegrityState.key = key;
+  }
+}
+
+function formatIntegrityMessage(result) {
+  if (integrityModule && typeof integrityModule.formatIntegrityMessage === 'function') {
+    try {
+      return integrityModule.formatIntegrityMessage(result);
+    } catch {
+      /* fall through to local formatter */
+    }
+  }
+  const lines = [`dist integrity ${result.ok ? 'advisory' : 'drift'}`];
+  for (const r of result.reasons || []) {
+    lines.push(`- [${r.severity}] ${r.code}: ${r.message}`);
+  }
+  lines.push(`details: ${JSON.stringify(result.details || {})}`);
+  return lines.join('\n');
 }
 
 function checkPm2Status() {
@@ -116,6 +236,9 @@ function runChecks() {
         );
       }
     }
+
+    // 4. git-integrity (drift detection) — never throws by contract.
+    checkGitIntegrity();
 
     // Reset self-failure counter on success
     if (selfFailures > 0) {
