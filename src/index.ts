@@ -9,6 +9,7 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   MAX_MESSAGES_PER_PROMPT,
+  OPS_ALERT_JID,
   POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
@@ -172,6 +173,37 @@ function getAllPollableJids(): string[] {
   const registered = Object.keys(registeredGroups);
   const linked = [...jidLinksCache.keys()];
   return [...new Set([...registered, ...linked])];
+}
+
+/**
+ * Route ops/liveness alert text (hang timeouts, silent-death) to the dedicated
+ * OPS_ALERT_JID — but ONLY when it is configured AND a registered channel
+ * actually owns that JID. Otherwise the alert is logged and dropped.
+ *
+ * This MUST NEVER fall back to the main user group chat: ops/liveness noise
+ * leaking into the user's conversation was the bug this helper exists to fix.
+ */
+async function routeOpsAlert(text: string): Promise<void> {
+  if (!OPS_ALERT_JID) {
+    logger.warn({ text }, 'ops-alert: OPS_ALERT_JID not set — alert log-only');
+    return;
+  }
+  const channel = findChannel(channels, OPS_ALERT_JID);
+  if (!channel) {
+    logger.warn(
+      { jid: OPS_ALERT_JID, text },
+      'ops-alert: no registered channel owns OPS_ALERT_JID — alert log-only',
+    );
+    return;
+  }
+  try {
+    await channel.sendMessage(OPS_ALERT_JID, text);
+  } catch (e) {
+    logger.error(
+      { e, jid: OPS_ALERT_JID },
+      'ops-alert: send to OPS_ALERT_JID failed',
+    );
+  }
 }
 
 /**
@@ -1352,20 +1384,9 @@ async function main(): Promise<void> {
   });
   initFormationHandler();
   queue.setProcessMessagesFn(processGroupMessages);
-  queue.setNotifyMainFn(async (text) => {
-    const mainEntry = Object.entries(registeredGroups).find(
-      ([, g]) => g.isMain === true,
-    );
-    if (!mainEntry) {
-      logger.warn('notifyMain: no main group');
-      return;
-    }
-    try {
-      await routeOutbound(channels, mainEntry[0], text);
-    } catch (e) {
-      logger.error({ e }, 'notifyMain routeOutbound failed');
-    }
-  });
+  // Hang-timeout / D1-D2 alerts are ops/liveness noise — route them to the
+  // dedicated OPS_ALERT_JID (or log-only), NEVER to the main user chat.
+  queue.setNotifyMainFn(routeOpsAlert);
   queue.setRequeueFn((primaryJid) => {
     const jids = [primaryJid, ...getSecondaryJids(primaryJid)];
     for (const jid of jids) {
@@ -1433,30 +1454,26 @@ async function main(): Promise<void> {
         'session-monitor: in-memory session cleared after hard reset',
       );
     },
+    // In-flight predicate: defer archive-and-reset while ANY JID mapping to
+    // this folder has a container run active. OR across all matches so a
+    // run on a linked secondary JID still protects the shared session.
+    (groupFolder: string): boolean => {
+      for (const [jid, g] of Object.entries(registeredGroups)) {
+        if (g.folder !== groupFolder) continue;
+        if (queue.isActive(resolvePrimaryJid(jid))) return true;
+      }
+      return false;
+    },
   );
 
   // Start channel health monitor (Fix 2 — silent disconnect detection)
   startChannelHealthMonitor(() => channels);
 
   // Start silent-death detector: alarms when prompts arrive but zero
-  // container runs succeed within a rolling window. Uses the same
-  // main-channel notify path as the queue's hang-timeout alert; the
-  // outbound text is plain ops content (no allergen+affirmative) so
-  // guardedOutbound's screener passes.
-  startSilentDeathDetector(async (text) => {
-    const mainEntry = Object.entries(registeredGroups).find(
-      ([, g]) => g.isMain === true,
-    );
-    if (!mainEntry) {
-      logger.warn('silent-death: no main group; alarm only logged');
-      return;
-    }
-    try {
-      await routeOutbound(channels, mainEntry[0], text);
-    } catch (e) {
-      logger.error({ e }, 'silent-death: routeOutbound failed');
-    }
-  });
+  // container runs succeed within a rolling window. This is ops/liveness
+  // noise, so it routes to the dedicated OPS_ALERT_JID (or log-only) via
+  // routeOpsAlert and MUST NEVER leak into the main user chat.
+  startSilentDeathDetector(routeOpsAlert);
 
   // Start dead letter queue retry worker (Fix 4 — outbound message recovery)
   startDeadLetterWorker(async (jid, text) => {

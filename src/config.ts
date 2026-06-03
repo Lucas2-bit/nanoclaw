@@ -9,6 +9,7 @@ const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
   'TZ',
+  'OPS_ALERT_JID',
 ]);
 
 export const ASSISTANT_NAME =
@@ -16,6 +17,11 @@ export const ASSISTANT_NAME =
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER ||
     envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
+// Optional dedicated JID for ops/liveness alerts (hang timeouts, silent-death).
+// Default '' (unset). When unset — or when no registered channel owns it —
+// ops alerts are log-only and MUST NOT fall back to the main user chat.
+export const OPS_ALERT_JID =
+  process.env.OPS_ALERT_JID || envConfig.OPS_ALERT_JID || '';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
@@ -54,6 +60,14 @@ export const QUEUE_HARD_TIMEOUT = parseInt(
   process.env.QUEUE_HARD_TIMEOUT || '5400000',
   10,
 ); // 90 min
+// Absolute backstop for scheduled-task runs. Tasks (deep research, multi-step
+// jobs) legitimately run far longer than interactive messages, and dropping
+// their output at the 90-min message ceiling loses real work. Default 3x
+// QUEUE_HARD_TIMEOUT (270 min when QUEUE_HARD_TIMEOUT is 90 min).
+export const TASK_HARD_TIMEOUT = parseInt(
+  process.env.TASK_HARD_TIMEOUT || String(QUEUE_HARD_TIMEOUT * 3),
+  10,
+);
 export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
   10,

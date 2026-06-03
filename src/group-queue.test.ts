@@ -7,6 +7,9 @@ vi.mock('./config.js', () => ({
   DATA_DIR: '/tmp/nanoclaw-test-data',
   MAX_CONCURRENT_CONTAINERS: 2,
   QUEUE_HARD_TIMEOUT: 5_400_000,
+  // 3x QUEUE_HARD_TIMEOUT — must be set so the 'task' run label does not get a
+  // 0ms (undefined) hard-timeout timer.
+  TASK_HARD_TIMEOUT: 16_200_000,
 }));
 
 // Mock fs operations used by sendMessage/closeStdin
@@ -484,5 +487,37 @@ describe('GroupQueue', () => {
 
     resolveProcess!();
     await vi.advanceTimersByTimeAsync(10);
+  });
+
+  // --- isActive reflects in-flight run state (session-monitor deferral) ---
+
+  it('isActive is true while a run is in-flight and false after it completes', async () => {
+    let resolveProcess: () => void;
+
+    const processMessages = vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        resolveProcess = resolve;
+      });
+      return { ok: true, ranToCompletion: true };
+    });
+
+    queue.setProcessMessagesFn(processMessages);
+
+    // Before any run: not active
+    expect(queue.isActive('group1@g.us')).toBe(false);
+
+    // Start a run — it blocks until we release it
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Run is in-flight
+    expect(queue.isActive('group1@g.us')).toBe(true);
+
+    // Complete the run
+    resolveProcess!();
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Run finished — back to inactive (finally clears state.active)
+    expect(queue.isActive('group1@g.us')).toBe(false);
   });
 });

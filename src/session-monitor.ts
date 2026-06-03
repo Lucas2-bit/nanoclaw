@@ -110,6 +110,13 @@ function archiveAndResetSession(
 export type SessionResetCallback = (groupFolder: string) => void;
 
 /**
+ * Predicate returning true when a container run is currently in-flight for the
+ * given group folder. When true, a destructive archive-and-reset is deferred
+ * to the next monitor tick so an in-flight reply is not discarded.
+ */
+export type InFlightCheck = (groupFolder: string) => boolean;
+
+/**
  * Check session file sizes for all registered groups.
  * Logs a warning when a session file exceeds WARN_THRESHOLD_BYTES.
  * When CRITICAL_THRESHOLD_BYTES is exceeded: logs an error, writes an alert
@@ -123,6 +130,7 @@ export function checkSessionFileSizes(
   registeredGroups: Record<string, RegisteredGroup>,
   onCompact?: CompactTrigger,
   onSessionReset?: SessionResetCallback,
+  isFolderInFlight?: InFlightCheck,
 ): number {
   const sessions = getAllSessions();
   let criticalCount = 0;
@@ -149,6 +157,13 @@ export function checkSessionFileSizes(
     if (sizeBytes >= HARD_CEILING_BYTES) {
       // HARD CEILING: archive the file and nuke the session.
       // Don't try to compact - that requires loading the bloated file.
+      if (isFolderInFlight?.(group.folder)) {
+        logger.warn(
+          { groupFolder: group.folder, sessionId, sizeKB },
+          'session-monitor: reset deferred — run in-flight, will retry next tick',
+        );
+        continue;
+      }
       criticalCount++;
       const msg =
         `HARD CEILING: Session file for group "${group.folder}" is ${sizeKB} KB ` +
@@ -174,6 +189,13 @@ export function checkSessionFileSizes(
       }
     } else if (sizeBytes >= CRITICAL_THRESHOLD_BYTES) {
       // Archive immediately — compaction at this size causes API timeouts.
+      if (isFolderInFlight?.(group.folder)) {
+        logger.warn(
+          { groupFolder: group.folder, sessionId, sizeKB },
+          'session-monitor: reset deferred — run in-flight, will retry next tick',
+        );
+        continue;
+      }
       criticalCount++;
       const msg =
         `CRITICAL: Session file for group "${group.folder}" is ${sizeKB} KB ` +
@@ -265,6 +287,7 @@ export function startSessionMonitor(
   getRegisteredGroups: () => Record<string, RegisteredGroup>,
   onCompact?: CompactTrigger,
   onSessionReset?: SessionResetCallback,
+  isFolderInFlight?: InFlightCheck,
 ): void {
   logger.info(
     {
@@ -279,7 +302,12 @@ export function startSessionMonitor(
 
   const loop = () => {
     try {
-      checkSessionFileSizes(getRegisteredGroups(), onCompact, onSessionReset);
+      checkSessionFileSizes(
+        getRegisteredGroups(),
+        onCompact,
+        onSessionReset,
+        isFolderInFlight,
+      );
     } catch (err) {
       logger.warn({ err }, 'session-monitor: error during check');
     }

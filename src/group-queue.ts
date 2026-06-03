@@ -6,6 +6,7 @@ import {
   DATA_DIR,
   MAX_CONCURRENT_CONTAINERS,
   QUEUE_HARD_TIMEOUT,
+  TASK_HARD_TIMEOUT,
 } from './config.js';
 import { stopContainer } from './container-runtime.js';
 import { logger } from './logger.js';
@@ -157,6 +158,15 @@ export class GroupQueue {
   }
 
   /**
+   * Return true if a container run is currently in-flight for the given JID.
+   * Used by the session monitor to defer a destructive archive-and-reset while
+   * a reply is mid-generation for the group.
+   */
+  isActive(groupJid: string): boolean {
+    return this.groups.get(groupJid)?.active === true;
+  }
+
+  /**
    * Atomically write queue state to QUEUE_STATE_PATH using temp-file + rename.
    * Also updates the tick_ts field so the supervisor can detect heartbeat staleness
    * independent of whether a write was triggered by a mutation or the tick timer.
@@ -255,11 +265,17 @@ export class GroupQueue {
       (error) => ({ status: 'error' as const, error }),
     );
 
+    // Scheduled tasks get the larger TASK_HARD_TIMEOUT backstop so long-running
+    // jobs are not killed at the interactive-message ceiling; messages use
+    // QUEUE_HARD_TIMEOUT.
+    const hardTimeout =
+      label === 'task' ? TASK_HARD_TIMEOUT : QUEUE_HARD_TIMEOUT;
+
     let timer: ReturnType<typeof setTimeout> | null = null;
     const timeout = new Promise<{ status: 'timeout' }>((resolve) => {
       timer = setTimeout(
         () => resolve({ status: 'timeout' as const }),
-        QUEUE_HARD_TIMEOUT,
+        hardTimeout,
       );
     });
 
@@ -268,7 +284,7 @@ export class GroupQueue {
 
     if (result.status === 'timeout') {
       logger.warn(
-        { groupJid, label, timeoutMs: QUEUE_HARD_TIMEOUT },
+        { groupJid, label, timeoutMs: hardTimeout },
         'Queue hard timeout reached',
       );
     }
@@ -307,9 +323,11 @@ export class GroupQueue {
       }
     }
     if (this.notifyMainFn) {
+      const hardTimeout =
+        label === 'task' ? TASK_HARD_TIMEOUT : QUEUE_HARD_TIMEOUT;
       try {
         await this.notifyMainFn(
-          `Agent hang detected on group ${groupJid} (${label}): exceeded ${Math.round(QUEUE_HARD_TIMEOUT / 60000)}m, container killed${label === 'message' ? ', message requeued' : ''}.`,
+          `Agent hang detected on group ${groupJid} (${label}): exceeded ${Math.round(hardTimeout / 60000)}m, container killed${label === 'message' ? ', message requeued' : ''}.`,
         );
       } catch (e) {
         logger.error({ e }, 'notifyMain failed');
