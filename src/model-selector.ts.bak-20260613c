@@ -72,8 +72,6 @@ interface RoutingConfig {
     reason: string;
   }>;
   defaultComplexity: TaskComplexity;
-  scheduledDefaultComplexity?: TaskComplexity;
-  scheduledOpusTaskIds?: string[];
 }
 
 // ============================================================================
@@ -130,8 +128,6 @@ function loadConfig(): RoutingConfig {
       pinnedGroups: ['telegram_main', 'whatsapp_main'],
       rules: [],
       defaultComplexity: 'medium',
-      scheduledDefaultComplexity: 'medium',
-      scheduledOpusTaskIds: ['pdny84', '8f7tzw', 'q6ssk4', 'n6h3tc'],
     };
   }
 }
@@ -237,16 +233,6 @@ export function selectModel(ctx: RoutingContext): RoutingDecision {
     };
   }
 
-  // Scheduled task model routing (safety-net fallback; task-scheduler normally pre-sets input.model)
-  if (ctx.isScheduledTask) {
-    const scheduledDefault = config.scheduledDefaultComplexity ?? 'medium';
-    return {
-      model: scheduledDefault === 'heavy' ? config.models.heavy : config.models.medium,
-      complexity: scheduledDefault as TaskComplexity,
-      reason: 'scheduled-default',
-    };
-  }
-
   // Pinned groups always use the heavy model
   if (config.pinnedGroups.includes(ctx.groupFolder)) {
     return {
@@ -275,21 +261,6 @@ export function selectModel(ctx: RoutingContext): RoutingDecision {
     complexity: defaultComplexity,
     reason: 'default',
   };
-}
-
-// ============================================================================
-// Scheduled Task Model Helper
-// ============================================================================
-
-/**
- * Resolve the model string for a scheduled task.
- * Carve-out IDs (scheduledOpusTaskIds in model-routing.json) get heavy (Opus).
- * All other scheduled tasks get medium (Sonnet).
- * Falls back to medium if config is unreadable (per loadConfig() defaults above).
- */
-export function getScheduledTaskModel(taskId: string): string {
-  const opusIds = new Set<string>(config.scheduledOpusTaskIds ?? []);
-  return opusIds.has(taskId) ? config.models.heavy : config.models.medium;
 }
 
 // ============================================================================

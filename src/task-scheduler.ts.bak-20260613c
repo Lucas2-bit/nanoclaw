@@ -24,7 +24,6 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
-import { getScheduledTaskModel } from './model-selector.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
 /** Returns true if the session has a valid backing store (JSONL file or directory). */
@@ -216,7 +215,6 @@ async function runTask(
         chatJid: task.chat_jid,
         isMain,
         isScheduledTask: true,
-        model: getScheduledTaskModel(task.id),
         assistantName: ASSISTANT_NAME,
         script: task.script || undefined,
       },

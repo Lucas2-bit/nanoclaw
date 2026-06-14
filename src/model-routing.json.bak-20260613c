@@ -25,7 +25,5 @@
     { "condition": "promptLength < 500 && !hasCodeContext", "complexity": "light", "reason": "triage" }
   ],
   "defaultComplexity": "medium",
-  "scheduledDefaultComplexity": "medium",
-  "scheduledOpusTaskIds": ["pdny84", "8f7tzw", "q6ssk4", "n6h3tc", "0hfoyi", "cue8d8", "99axay"],
   "_comment": "Edit this file to update models/pricing without code changes. New model release? Update 'models' and 'pricing', restart nanoclaw."
 }

@@ -226,28 +226,7 @@ export class GmailChannel implements Channel {
   // --- Private ---
 
   private buildQuery(): string {
-    // Known no-value senders that should never poll/deliver/spawn a wake.
-    // Applied to BOTH the Primary branch and the safety-override branch below.
-    const blocklist = [
-      '-from:linkedin.com',
-      '-from:youtube.com',
-      '-from:calendar-notification@google.com',
-      '-from:no-reply@accounts.google.com',
-      '-from:e.economist.com',
-      '-from:smartbrief.com',
-      '-from:e-suttons.co.uk',
-      '-from:hiltongrandvacations.com',
-      '-from:travel.hiltongrandvacations.com',
-    ].join(' ');
-
-    // Safety override: wake immediately for unread mail (regardless of
-    // category, but still minus the noise blocklist) whose subject matches a
-    // critical term, or that comes from the family solicitor. Caught even if
-    // Gmail mis-categorizes the mail out of Primary.
-    const override =
-      'subject:(urgent OR allergy OR hospital OR "A&E" OR medication OR EHCP OR tribunal OR solicitor OR completion OR offer) OR from:cm-murray.com';
-
-    return `is:unread (category:primary OR ${override}) ${blocklist}`;
+    return 'is:unread category:primary';
   }
 
   private async pollForMessages(): Promise<void> {
