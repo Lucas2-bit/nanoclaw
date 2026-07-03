@@ -98,7 +98,7 @@ function loadConfig(): RoutingConfig {
     return {
       models: {
         heavy: 'claude-opus-4-8',
-        medium: 'claude-sonnet-5',
+        medium: 'claude-sonnet-4-6',
         light: 'claude-haiku-4-5-20251001',
       },
       pricing: {
@@ -113,12 +113,6 @@ function loadConfig(): RoutingConfig {
           output: 15.0,
           cache_write: 3.75,
           cache_read: 0.3,
-        },
-        'claude-sonnet-5': {
-          input: 2.0,
-          output: 10.0,
-          cache_write: 2.5,
-          cache_read: 0.2,
         },
         'claude-haiku-4-5-20251001': {
           input: 0.8,

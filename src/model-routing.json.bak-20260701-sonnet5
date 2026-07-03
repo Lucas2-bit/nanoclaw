@@ -1,7 +1,7 @@
 {
   "models": {
     "heavy": "claude-opus-4-8",
-    "medium": "claude-sonnet-5",
+    "medium": "claude-sonnet-4-6",
     "light": "claude-haiku-4-5-20251001"
   },
   "pricing": {
@@ -9,7 +9,6 @@
     "claude-opus-4-7":           { "input": 5.0,   "output": 25.0,  "cache_write": 6.25,  "cache_read": 0.50 },
     "claude-opus-4-6":           { "input": 15.0,  "output": 75.0,  "cache_write": 18.75, "cache_read": 1.50 },
     "claude-sonnet-4-6":         { "input": 3.0,   "output": 15.0,  "cache_write": 3.75,  "cache_read": 0.30 },
-    "claude-sonnet-5":           { "input": 2.0,   "output": 10.0,  "cache_write": 2.5,   "cache_read": 0.20 },
     "claude-haiku-4-5-20251001": { "input": 0.80,  "output": 4.0,   "cache_write": 1.0,   "cache_read": 0.08 },
     "default":                   { "input": 3.0,   "output": 15.0,  "cache_write": 3.75,  "cache_read": 0.30 }
   },
