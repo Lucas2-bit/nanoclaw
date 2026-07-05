@@ -1279,14 +1279,20 @@ async function main(): Promise<void> {
   // IN ADDITION to delivering the original message. Plain allergen-free
   // text so the guard's screener never holds the flag itself.
   setOwnerPush(async (text) => {
-    const mainEntry = Object.entries(registeredGroups).find(
+    const mainEntries = Object.entries(registeredGroups).filter(
       ([, g]) => g.isMain === true,
     );
-    if (!mainEntry) {
+    if (mainEntries.length === 0) {
       logger.warn('outbound-guard: no main group; owner flag only logged');
       return;
     }
-    await routeOutbound(channels, mainEntry[0], text);
+    await Promise.all(
+      mainEntries.map(([jid]) =>
+        routeOutbound(channels, jid, text).catch((err) =>
+          logger.warn({ err, jid }, 'outbound-guard: owner-flag broadcast leg failed'),
+        ),
+      ),
+    );
   });
 
   // Start subsystems (independently of connection handler)
