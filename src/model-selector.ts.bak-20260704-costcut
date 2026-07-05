@@ -253,12 +253,12 @@ export function selectModel(ctx: RoutingContext): RoutingDecision {
     };
   }
 
-  // Pinned main groups default to the medium (Sonnet 5) model; escalate to Opus on demand.
+  // Pinned groups always use the heavy model
   if (config.pinnedGroups.includes(ctx.groupFolder)) {
     return {
-      model: config.models.medium,
-      complexity: 'medium',
-      reason: 'pinned-sonnet5-default',
+      model: config.models.heavy,
+      complexity: 'heavy',
+      reason: 'pinned-group',
     };
   }
 
