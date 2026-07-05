@@ -1289,7 +1289,10 @@ async function main(): Promise<void> {
     await Promise.all(
       mainEntries.map(([jid]) =>
         routeOutbound(channels, jid, text).catch((err) =>
-          logger.warn({ err, jid }, 'outbound-guard: owner-flag broadcast leg failed'),
+          logger.warn(
+            { err, jid },
+            'outbound-guard: owner-flag broadcast leg failed',
+          ),
         ),
       ),
     );

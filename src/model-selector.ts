@@ -247,7 +247,10 @@ export function selectModel(ctx: RoutingContext): RoutingDecision {
   if (ctx.isScheduledTask) {
     const scheduledDefault = config.scheduledDefaultComplexity ?? 'medium';
     return {
-      model: scheduledDefault === 'heavy' ? config.models.heavy : config.models.medium,
+      model:
+        scheduledDefault === 'heavy'
+          ? config.models.heavy
+          : config.models.medium,
       complexity: scheduledDefault as TaskComplexity,
       reason: 'scheduled-default',
     };
