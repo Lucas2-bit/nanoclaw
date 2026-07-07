@@ -11,7 +11,7 @@ STORE_DIR="$PROJECT_DIR/store"
 BACKUP_DIR="$PROJECT_DIR/backups"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG="$BACKUP_DIR/backup.log"
-NODE=$(which node || echo "/usr/local/bin/node")
+NODE=$(which node || echo "/opt/homebrew/bin/node")
 
 mkdir -p "$BACKUP_DIR"
 
