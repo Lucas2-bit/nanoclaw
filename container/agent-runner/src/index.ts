@@ -19,6 +19,7 @@ import path from 'path';
 import { execFile } from 'child_process';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { createGuardrailHook } from './guardrail-hook.js';
 
 interface ContainerInput {
   prompt: string;
@@ -513,6 +514,7 @@ async function runQuery(
         },
         hooks: {
           PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
+          PreToolUse: [{ hooks: [createGuardrailHook(log)] }],
         },
       }
     })) {
@@ -687,6 +689,7 @@ async function main(): Promise<void> {
           settingSources: ['project', 'user'] as const,
           hooks: {
             PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
+            PreToolUse: [{ hooks: [createGuardrailHook(log)] }],
           },
         },
       })) {
