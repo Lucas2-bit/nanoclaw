@@ -87,20 +87,21 @@ function bashCommandMatches(
   patterns: string[],
   command: string,
 ): string | null {
+  // Match ONLY against the rule's own patterns — no hardcoded verb tables.
+  // Hardcoded tables become a second source of truth that drifts from the DB
+  // (root cause of the sys_no_delete_files/bash:curl false positive that
+  // would have caused a self-outage on enforce flip — DEC-20260707-005).
+  // A pattern qualifies as a bash-verb match only if it's a simple token
+  // (no underscore, no wildcards other than trailing *). Tool-name patterns
+  // like `send_email*` or `mcp__gmail__send*` intentionally fail this check
+  // and never match bash commands — they only match via nameMatch.
   const c = command.toLowerCase();
-  const del = ['rm', 'unlink', 'shred', 'file_delete'];
-  const net = ['curl', 'wget', 'nc ', 'ssh ', 'scp '];
-  for (const t of del)
-    if (new RegExp(`(^|[;&|\\s])${t}(\\s|$)`).test(c)) return `bash:${t}`;
-  for (const n of net) if (c.includes(n)) return `bash:${n.trim()}`;
   for (const p of patterns) {
-    const bare = p.replace(/\*$/, '');
-    if (
-      bare &&
-      !bare.includes('_') &&
-      new RegExp(`(^|[;&|\\s])${bare}(\\s|$)`).test(c)
-    )
+    const bare = p.replace(/\*$/, '').toLowerCase();
+    if (!bare || bare.includes('_')) continue;
+    if (new RegExp(`(^|[;&|\\s])${bare}(\\s|$)`).test(c)) {
       return `bash:${bare}`;
+    }
   }
   return null;
 }
