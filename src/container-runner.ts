@@ -338,6 +338,14 @@ async function buildContainerArgs(
     args.push('-e', `ANTHROPIC_MODEL=${model}`);
   }
 
+  // Guardrail hook mode ('dryrun' | 'enforce'). Passed through from host env if
+  // set; if unset, the hook defaults to dryrun. Flip enforce by setting
+  // GUARDRAIL_HOOK_MODE on nanoclaw's env (declared in ecosystem.config.cjs)
+  // and restarting. Kept as a pass-through so mode changes are ops not code.
+  if (process.env.GUARDRAIL_HOOK_MODE) {
+    args.push('-e', `GUARDRAIL_HOOK_MODE=${process.env.GUARDRAIL_HOOK_MODE}`);
+  }
+
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
 

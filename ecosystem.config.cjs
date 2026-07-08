@@ -3,6 +3,13 @@ module.exports = {
     name: "nanoclaw",
     script: "npm",
     args: "start",
+    env: {
+      // Guardrail hook mode: 'enforce' actually blocks matches; 'dryrun' logs
+      // WOULD-BLOCK but allows through. Flipped 2026-07-08 after Option A +
+      // bashCommandMatches fix (5-case verify passed). Rollback: change to
+      // 'dryrun' and `pm2 restart nanoclaw --update-env`.
+      GUARDRAIL_HOOK_MODE: "enforce"
+    },
     wait_ready: false,
     kill_timeout: 15000,
     restart_delay: 5000,
