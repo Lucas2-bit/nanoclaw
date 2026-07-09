@@ -260,9 +260,16 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Copy agent-runner source into a per-group writable location so agents
-  // can customize it (add tools, change behavior) without affecting other
-  // groups. Recompiled on container startup via entrypoint.sh.
+  // Copy agent-runner source into a per-group writable location. Recompiled
+  // on container startup via entrypoint.sh.
+  //
+  // Always refreshed from source on every spawn: no staleness-detection
+  // logic to get wrong again (2026-07-08 incident: mtime-based needsCopy
+  // only compared index.ts, blind to sibling files like guardrail-hook.ts
+  // — and even for index.ts, fs.cpSync stamps a newer 'now' timestamp than
+  // the real source, so the check never re-fires). Per-group customizations
+  // are NOT preserved by this cache — if that becomes a real need later,
+  // load overrides from a separate per-group path instead of mutating here.
   const agentRunnerSrc = path.join(
     projectRoot,
     'container',
@@ -276,16 +283,10 @@ function buildVolumeMounts(
     'agent-runner-src',
   );
   if (fs.existsSync(agentRunnerSrc)) {
-    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
-    const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
-    const needsCopy =
-      !fs.existsSync(groupAgentRunnerDir) ||
-      !fs.existsSync(cachedIndex) ||
-      (fs.existsSync(srcIndex) &&
-        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
-    if (needsCopy) {
-      fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+    if (fs.existsSync(groupAgentRunnerDir)) {
+      fs.rmSync(groupAgentRunnerDir, { recursive: true, force: true });
     }
+    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
