@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -49,6 +50,7 @@ import {
   getRouterState,
   hasPendingCompact,
   initDatabase,
+  insertDeadLetter,
   linkJid,
   setRegisteredGroup,
   setRouterState,
@@ -1014,6 +1016,94 @@ async function startMessageLoop(): Promise<void> {
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
+
+          // RISK-013 Chunk 2 — oversize-batch guard.
+          //
+          // If the formatted batch is too large to safely pipe into the agent
+          // container, park it in the dead_letter_queue with hold_type =
+          // 'oversize_manual' rather than piping and inducing a 90-minute hang.
+          // The auto-resend worker (dead-letter-worker.ts) SKIPS these entries
+          // — a human must call releaseOversizeHold(id) after reviewing before
+          // the batch is retried, since blindly replaying content that
+          // caused a hang would just re-hang.
+          //
+          // Cursor is advanced ONLY on a confirmed dead-letter insert; on any
+          // insert failure the cursor stays put and the loop retries this
+          // batch next tick (nothing is silently dropped, per the May-31 SEV-1
+          // rule this whole chunk is built around).
+          //
+          // 50,000 chars is provisional — below the one real observed hang
+          // (75,717 chars on Jul-8) with margin, not derived from the actual
+          // SDK context limit.
+          const OVERSIZE_BATCH_THRESHOLD_CHARS = 50_000;
+          if (formatted.length > OVERSIZE_BATCH_THRESHOLD_CHARS) {
+            const firstTs = messagesToSend[0].timestamp;
+            const lastTs =
+              messagesToSend[messagesToSend.length - 1].timestamp;
+            // Deterministic id (NOT randomUUID like recordSendFailure's normal
+            // path) so INSERT OR IGNORE actually dedupes: a restart loop
+            // re-hitting this same guard for the identical batch produces ONE
+            // row, not an unbounded pile of duplicates.
+            const id = createHash('sha256')
+              .update(`oversize:${chatJid}:${firstTs}:${lastTs}`)
+              .digest('hex');
+            try {
+              insertDeadLetter({
+                id,
+                group_folder: group.folder,
+                chat_jid: chatJid,
+                content: formatted,
+                failed_at: new Date().toISOString(),
+                last_error: `oversized batch (${formatted.length} chars), held instead of piping`,
+                hold_type: 'oversize_manual',
+              });
+              logger.error(
+                { chatJid, chars: formatted.length, id },
+                'startMessageLoop: oversized batch parked in dead_letter_queue (hold_type=oversize_manual)',
+              );
+              routeOpsAlert(
+                `Oversized message batch HELD (not lost) for ${chatJid} ` +
+                  `(${formatted.length} chars) — dead_letter_queue id ${id}. ` +
+                  `Requires MANUAL review + releaseOversizeHold() before resend; ` +
+                  `the auto-resend worker will NOT touch it on its own.`,
+              ).catch((err) =>
+                logger.warn(
+                  { err, chatJid },
+                  'routeOpsAlert failed for oversized-batch alert',
+                ),
+              );
+              // Advance the cursor past this parked batch so the loop doesn't
+              // re-pull and re-insert it every tick. INSERT OR IGNORE + the
+              // deterministic id above would keep the DLQ clean either way,
+              // but leaving the cursor unmoved would still churn CPU + logs.
+              lastAgentTimestamp[chatJid] = lastTs;
+              saveState();
+            } catch (err) {
+              // insertDeadLetter itself failed (disk full, DB locked, etc.).
+              // Do NOT advance the cursor — leave it so the loop retries this
+              // batch next tick instead of silently losing it. The whole
+              // point of this chunk is to remove silent-drop paths; it
+              // cannot itself have one.
+              logger.error(
+                { chatJid, err },
+                'startMessageLoop: CRITICAL — dead-letter insert FAILED for oversized batch, cursor NOT advanced',
+              );
+              routeOpsAlert(
+                `CRITICAL: oversized batch STUCK for ${chatJid} — ` +
+                  `dead-letter insert failed (${err}). Needs manual intervention.`,
+              ).catch((err2) =>
+                logger.warn(
+                  { err: err2 },
+                  'routeOpsAlert failed for stuck-oversized-batch CRITICAL alert',
+                ),
+              );
+            }
+            // NOT `return` — this runs inside startMessageLoop's inner
+            // `for (const [primaryJid, channelEntries] of messagesByGroup)`
+            // loop; `return` would abort processing every OTHER group in this
+            // poll cycle too. Must be `continue`.
+            continue;
+          }
 
           // Use primaryJid for queue operations (serialization) but chatJid for outbound
           if (queue.sendMessage(primaryJid, formatted)) {

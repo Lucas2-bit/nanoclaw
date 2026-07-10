@@ -163,6 +163,20 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* columns already exist */
   }
+
+  // Add hold_type column to dead_letter_queue if it doesn't exist (RISK-013
+  // Chunk 2). NULL = normal dead-letter entry, eligible for the
+  // dead-letter-worker.ts auto-resend loop (unchanged behavior for real
+  // send failures). 'oversize_manual' = parked by the oversize-batch guard
+  // in startMessageLoop; auto-resend MUST skip these until a human
+  // explicitly releases the hold via releaseOversizeHold().
+  try {
+    database.exec(
+      `ALTER TABLE dead_letter_queue ADD COLUMN hold_type TEXT DEFAULT NULL`,
+    );
+  } catch {
+    /* column already exists */
+  }
 }
 
 export function initDatabase(): void {
@@ -782,18 +796,35 @@ export interface DeadLetterEntry {
   last_error: string | null;
   /** 0 = pending retry, 1 = resolved (sent successfully), -1 = permanently failed */
   resolved: number;
+  /**
+   * NULL = normal send-failure entry, eligible for dead-letter-worker.ts's
+   * automatic resend loop. 'oversize_manual' = parked by the oversize-batch
+   * guard in src/index.ts startMessageLoop (RISK-013 Chunk 2); excluded from
+   * auto-resend until a human clears it via releaseOversizeHold(). Blindly
+   * auto-resending an oversized batch would replay the exact content that
+   * caused the original hang — the manual gate is intentional.
+   */
+  hold_type: 'oversize_manual' | null;
 }
 
 /**
  * Insert a failed outbound message into the dead letter queue.
+ *
+ * `hold_type` defaults to null for genuine send failures (unchanged behavior
+ * from before RISK-013 Chunk 2 — dead-letter-worker.ts's auto-resend loop
+ * still processes these on its next tick). Pass 'oversize_manual' to park a
+ * batch that must not be auto-resent (e.g. the oversize-batch guard in
+ * startMessageLoop).
  */
 export function insertDeadLetter(
-  entry: Omit<DeadLetterEntry, 'retry_count' | 'resolved'>,
+  entry: Omit<DeadLetterEntry, 'retry_count' | 'resolved' | 'hold_type'> & {
+    hold_type?: DeadLetterEntry['hold_type'];
+  },
 ): void {
   db.prepare(
     `
-    INSERT OR IGNORE INTO dead_letter_queue (id, group_folder, chat_jid, content, failed_at, retry_count, last_error, resolved)
-    VALUES (?, ?, ?, ?, ?, 0, ?, 0)
+    INSERT OR IGNORE INTO dead_letter_queue (id, group_folder, chat_jid, content, failed_at, retry_count, last_error, resolved, hold_type)
+    VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)
   `,
   ).run(
     entry.id,
@@ -802,23 +833,41 @@ export function insertDeadLetter(
     entry.content,
     entry.failed_at,
     entry.last_error,
+    entry.hold_type ?? null,
   );
 }
 
 /**
  * Return all unresolved dead letter entries with retry_count < maxRetries,
- * ordered oldest-first.
+ * ordered oldest-first. Entries with a non-null `hold_type` (e.g.
+ * 'oversize_manual') are EXCLUDED — the dead-letter-worker.ts auto-resend
+ * loop must never touch them; they wait for an explicit releaseOversizeHold()
+ * call.
  */
 export function getPendingDeadLetters(maxRetries: number): DeadLetterEntry[] {
   return db
     .prepare(
       `
     SELECT * FROM dead_letter_queue
-    WHERE resolved = 0 AND retry_count < ?
+    WHERE resolved = 0 AND retry_count < ? AND hold_type IS NULL
     ORDER BY failed_at
   `,
     )
     .all(maxRetries) as DeadLetterEntry[];
+}
+
+/**
+ * Release an 'oversize_manual' hold so the entry becomes eligible for the
+ * normal dead-letter-worker.ts auto-resend loop on its next tick. Call this
+ * ONLY after a human has confirmed the parked batch is safe to attempt —
+ * reviewed, still relevant, and not itself liable to reproduce the original
+ * hang. This is the explicit manual-clearance gate RISK-013 Chunk 2 requires;
+ * nothing calls this automatically.
+ */
+export function releaseOversizeHold(id: string): void {
+  db.prepare(`UPDATE dead_letter_queue SET hold_type = NULL WHERE id = ?`).run(
+    id,
+  );
 }
 
 /**
