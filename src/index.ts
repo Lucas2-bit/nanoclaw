@@ -1130,7 +1130,12 @@ async function main(): Promise<void> {
   pruneStaleSessionIds();
   pruneOrphanSessionFiles();
   logger.info('Stale sessions pruned');
-  startAlertConsumer();
+  // RISK-013 Chunk 4: pass routeOpsAlert so a transition to critical on a
+  // git-integrity alert (dist-drift, built-dirty) actually pages, instead of
+  // draining to log only — the ~9h alert-silence gap on 07-09 is what this
+  // exists to close. Edge-triggered inside scanOnce so a stuck-critical
+  // condition pages ONCE, not on every scan cycle.
+  startAlertConsumer(routeOpsAlert);
 
   restoreRemoteControl();
 
