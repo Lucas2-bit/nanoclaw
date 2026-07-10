@@ -89,9 +89,7 @@ function pruneConsumed(): void {
   }
 }
 
-function scanOnce(
-  onAlert?: (msg: string) => void | Promise<void>,
-): void {
+function scanOnce(onAlert?: (msg: string) => void | Promise<void>): void {
   try {
     let entries: fs.Dirent[];
     try {

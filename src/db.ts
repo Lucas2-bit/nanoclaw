@@ -995,7 +995,11 @@ export function checkOutboundDedup(
   sentAt: number,
 ): number | null {
   try {
-    const candidates = outboundDedupCandidateHashes(groupJid, normalized, sentAt);
+    const candidates = outboundDedupCandidateHashes(
+      groupJid,
+      normalized,
+      sentAt,
+    );
     const placeholders = candidates.map(() => '?').join(', ');
     const row = db
       .prepare(
