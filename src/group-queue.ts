@@ -28,6 +28,21 @@ const BASE_RETRY_MS = 5000;
 /** How long to keep the circuit open before transitioning to half-open (ms). */
 const CIRCUIT_RESET_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
+// RISK-013 Chunk 1a — startup assertion. TASK_HARD_TIMEOUT is the absolute
+// backstop for scheduled tasks; QUEUE_HARD_TIMEOUT the absolute backstop for
+// message-loop runs. TASK must be strictly larger — otherwise a message-loop
+// run would outlive its task-scheduler wrapper and produce the exact
+// silent-outlive-your-parent failure class this timeout pair exists to
+// prevent. Enforced at module load so any future edit to either value fails
+// loud at boot, not silently at 3am.
+if (!(TASK_HARD_TIMEOUT > QUEUE_HARD_TIMEOUT)) {
+  throw new Error(
+    `Invalid timeout config: TASK_HARD_TIMEOUT (${TASK_HARD_TIMEOUT}ms) ` +
+      `must be strictly greater than QUEUE_HARD_TIMEOUT (${QUEUE_HARD_TIMEOUT}ms). ` +
+      `Fix the values in src/config.ts before deploying.`,
+  );
+}
+
 /** Circuit breaker states per group. */
 export type CircuitState = 'closed' | 'open' | 'half-open';
 
@@ -55,6 +70,14 @@ interface GroupState {
   circuitOpenedAt: number | null;
   /** True when one probe message has been dispatched in half-open state. */
   halfOpenProbeDispatched: boolean;
+  /**
+   * RISK-013 Chunk 1a — edge-trigger tracker for the circuit-open ops alert.
+   * True once an alert has fired for the CURRENT open-circuit episode; reset
+   * to false only on a real recovery (half-open probe succeeds → closed).
+   * Stops a single ongoing outage from re-paging on every 5-minute
+   * open→half-open→open cycle (~100 pages over 9h under the previous design).
+   */
+  circuitOutageAlerted: boolean;
 }
 
 /**
@@ -126,6 +149,7 @@ export class GroupQueue {
         circuitState: 'closed',
         circuitOpenedAt: null,
         halfOpenProbeDispatched: false,
+        circuitOutageAlerted: false,
       };
       this.groups.set(groupJid, state);
     }
@@ -687,6 +711,23 @@ export class GroupQueue {
                 { groupJid },
                 'Circuit breaker: probe succeeded, circuit closed',
               );
+              // RISK-013 Chunk 1a: reset the edge-trigger flag on a real
+              // recovery so a genuine NEW outage later re-pages. Also
+              // notify main once — closes the loop on the earlier
+              // OPEN alert so the recipient knows the outage cleared.
+              if (state.circuitOutageAlerted) {
+                state.circuitOutageAlerted = false;
+                if (this.notifyMainFn) {
+                  this.notifyMainFn(
+                    `Circuit breaker RECOVERED for ${groupJid} — probe succeeded, circuit closed`,
+                  ).catch((err) =>
+                    logger.warn(
+                      { err, groupJid },
+                      'notifyMainFn (circuit recovery) failed',
+                    ),
+                  );
+                }
+              }
             }
             state.retryCount = 0;
             // Record successful completion for D1 alarm tracking ONLY when a
@@ -785,6 +826,26 @@ export class GroupQueue {
       state.circuitOpenedAt = Date.now();
       state.halfOpenProbeDispatched = false;
       state.retryCount = 0;
+      // RISK-013 Chunk 1a: edge-triggered OPEN alert. Fires only if this is
+      // a NEW outage (flag was false); the same open→half-open→open cycle
+      // repeated during a persistent outage sees the flag already set and
+      // stays silent. Real recovery clears the flag; a distinct later outage
+      // alerts again.
+      if (!state.circuitOutageAlerted) {
+        state.circuitOutageAlerted = true;
+        if (this.notifyMainFn) {
+          this.notifyMainFn(
+            `Circuit breaker OPEN for ${groupJid} — probe failed, outage ongoing ` +
+              `(will keep retrying via half-open every ${CIRCUIT_RESET_TIMEOUT_MS / 60000}min ` +
+              `until it recovers; you will NOT be re-paged for this same outage)`,
+          ).catch((err) =>
+            logger.warn(
+              { err, groupJid },
+              'notifyMainFn (circuit reopen) failed',
+            ),
+          );
+        }
+      }
       return;
     }
 
@@ -801,6 +862,21 @@ export class GroupQueue {
         },
         'Circuit breaker: opened after max retries exceeded',
       );
+      // RISK-013 Chunk 1a: edge-triggered OPEN alert on the initial-open path.
+      // Same guard as the half-open→open reopen above — one alert per outage.
+      if (!state.circuitOutageAlerted) {
+        state.circuitOutageAlerted = true;
+        if (this.notifyMainFn) {
+          this.notifyMainFn(
+            `Circuit breaker OPEN for ${groupJid} — max retries exceeded, outage starting`,
+          ).catch((err) =>
+            logger.warn(
+              { err, groupJid },
+              'notifyMainFn (circuit initial-open) failed',
+            ),
+          );
+        }
+      }
       return;
     }
 
