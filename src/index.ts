@@ -51,6 +51,9 @@ import {
   hasPendingCompact,
   initDatabase,
   insertDeadLetter,
+  checkOutboundDedup,
+  recordOutboundSendHash,
+  normalizeOutbound,
   linkJid,
   setRegisteredGroup,
   setRouterState,
@@ -669,39 +672,119 @@ async function processGroupMessages(chatJid: string): Promise<ProcessResult> {
         const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
         logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
         if (text) {
-          let delivered = false;
-          try {
-            delivered = await channel.sendMessage(activeChatJid, text);
-          } catch (err) {
-            recordSendFailure(activeChatJid, text, group.folder, err);
-            throw err; // re-throw so the caller still sees the error
-          }
-          // Only advance cursor + fire TTS follow-up when the user actually
-          // received the text. A HELD/suppressed send (allergen backstop,
-          // dedupe, queued-while-disconnected) returns false; treating it
-          // as success would drop the next inbound and TTS-speak text the
-          // user never saw.
-          if (delivered) {
-            outputSentToUser = true;
-            // Persist cursor now that output was confirmed sent to user
-            saveState();
+          // RISK-013 Chunk 3 (v2.4) — outbound dedup with cursor-safe semantics.
+          //
+          // checkOutboundDedup returns MAX(sent_at) of any prior send with the
+          // same normalized content within the LOOKBACK_BUCKETS window, or
+          // null (meaning: not a duplicate OR the lookup failed and it's
+          // failing open). Both null cases correctly fall through to the real
+          // send path below.
+          //
+          // A dedup-hit is NOT a failure. The content was genuinely delivered
+          // earlier in the window (that earlier send is what wrote the hash
+          // this lookup just matched). Treat it as a SUCCESS for cursor
+          // purposes — advance and persist — but skip actually re-sending.
+          const sentAt = Date.now();
+          const normalized = normalizeOutbound(text);
+          const originalSentAt = checkOutboundDedup(
+            activeChatJid,
+            normalized,
+            sentAt,
+          );
+          const isDuplicate = originalSentAt !== null;
 
-            // Voice response: if input had voice messages and channel supports it, send TTS
-            if (hasVoiceInput && channel.sendVoiceNote && group.voiceEnabled) {
+          if (isDuplicate) {
+            logger.warn(
+              {
+                group: group.name,
+                chatJid: activeChatJid,
+                gapMs: sentAt - originalSentAt!,
+              },
+              'Outbound dedup: suppressing duplicate send (content already delivered earlier in the lookback window) — treating as a successful send for cursor-persistence purposes',
+            );
+            outputSentToUser = true;
+            saveState();
+            // Do NOT call recordOutboundSendHash here — the hash was already
+            // recorded on the original send; recording again would refresh
+            // its timestamp for no reason.
+
+            // Time-gap-triggered ops alert. Retry-storm duplicates repeat
+            // within SECONDS of the original (the failure pattern this chunk
+            // exists to fix); an intentional human-driven resend of urgent
+            // content would land much later. Gating on a 5-min gap keeps the
+            // common case (retry-storm dupe) silent — so this doesn't
+            // recreate the ~56-alerts/day spam pattern that motivated
+            // RISK-013 in the first place. MAX(sent_at) semantics (not MIN)
+            // mean this is "5min since the MOST RECENT copy" — resistant to
+            // long-backoff retry-storm tails false-alerting.
+            const gapMs = sentAt - originalSentAt!;
+            const DEDUP_ALERT_GAP_THRESHOLD_MS = 5 * 60 * 1000;
+            if (gapMs > DEDUP_ALERT_GAP_THRESHOLD_MS) {
+              routeOpsAlert(
+                `Outbound dedup SUPPRESSED a duplicate send to ${activeChatJid}, ` +
+                  `${Math.round(gapMs / 60000)}min after the most recent prior send (over the ` +
+                  `${DEDUP_ALERT_GAP_THRESHOLD_MS / 60000}min retry-storm threshold). This may be ` +
+                  `an intentional resend (e.g. an unacknowledged safety-critical message) ` +
+                  `that was silently swallowed instead of delivered. Content was NOT re-sent. ` +
+                  `Review manually.`,
+              ).catch((err) =>
+                logger.warn(
+                  { err },
+                  'routeOpsAlert failed for dedup-suppression alert',
+                ),
+              );
+            }
+          } else {
+            let delivered = false;
+            try {
+              delivered = await channel.sendMessage(activeChatJid, text);
+            } catch (err) {
+              recordSendFailure(activeChatJid, text, group.folder, err);
+              throw err; // re-throw so the caller still sees the error
+            }
+            // UNCHANGED by RISK-013 v2.4: `delivered` can be false without
+            // throwing (allergen-safety backstop, queued-while-disconnected,
+            // etc). This gate is load-bearing and family-safety-adjacent —
+            // see specs/risk-013-v2.3-chunk3-panel-check.md. Do NOT remove
+            // or make unconditional.
+            if (delivered) {
+              outputSentToUser = true;
+              // Persist cursor now that output was confirmed sent to user
+              saveState();
+              // Only record the dedup hash AFTER delivery is confirmed and
+              // persisted. Wrapped in try/catch so a DB write failure here
+              // can never undo an already-settled send. Worst case of a
+              // swallowed error: one send loses dedup coverage.
               try {
-                const audioBuffer = await generateSpeech(text);
-                if (audioBuffer) {
-                  await channel.sendVoiceNote(activeChatJid, audioBuffer);
-                  logger.info(
-                    { group: group.name, bytes: audioBuffer.length },
-                    'Voice note response sent',
+                recordOutboundSendHash(activeChatJid, normalized, sentAt);
+              } catch (err) {
+                logger.warn(
+                  { err, chatJid: activeChatJid },
+                  'recordOutboundSendHash failed; delivery already confirmed and persisted, not rolled back',
+                );
+              }
+
+              // Voice response: if input had voice messages and channel supports it, send TTS
+              if (
+                hasVoiceInput &&
+                channel.sendVoiceNote &&
+                group.voiceEnabled
+              ) {
+                try {
+                  const audioBuffer = await generateSpeech(text);
+                  if (audioBuffer) {
+                    await channel.sendVoiceNote(activeChatJid, audioBuffer);
+                    logger.info(
+                      { group: group.name, bytes: audioBuffer.length },
+                      'Voice note response sent',
+                    );
+                  }
+                } catch (ttsErr) {
+                  logger.warn(
+                    { err: ttsErr },
+                    'TTS voice response failed - text was sent',
                   );
                 }
-              } catch (ttsErr) {
-                logger.warn(
-                  { err: ttsErr },
-                  'TTS voice response failed - text was sent',
-                );
               }
             }
           }
@@ -1038,8 +1121,7 @@ async function startMessageLoop(): Promise<void> {
           const OVERSIZE_BATCH_THRESHOLD_CHARS = 50_000;
           if (formatted.length > OVERSIZE_BATCH_THRESHOLD_CHARS) {
             const firstTs = messagesToSend[0].timestamp;
-            const lastTs =
-              messagesToSend[messagesToSend.length - 1].timestamp;
+            const lastTs = messagesToSend[messagesToSend.length - 1].timestamp;
             // Deterministic id (NOT randomUUID like recordSendFailure's normal
             // path) so INSERT OR IGNORE actually dedupes: a restart loop
             // re-hitting this same guard for the identical batch produces ONE

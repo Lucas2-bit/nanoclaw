@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
@@ -94,6 +95,18 @@ function createSchema(database: Database.Database): void {
       resolved INTEGER DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_dlq_resolved ON dead_letter_queue(resolved);
+    -- RISK-013 Chunk 3 — outbound-send content hashes for dedup suppression.
+    -- Records the (groupJid, normalizedText, bucket) hash of every genuinely
+    -- delivered outbound send; lookup on future sends catches verbatim repeats
+    -- within a rolling 120-min window (see 15min bucket + 8-bucket lookback
+    -- in checkOutboundDedup). sent_at is ms epoch of the confirmed send.
+    -- Index on sent_at is for the opportunistic TTL cleanup query, not the
+    -- primary dedup lookup (which hits the primary-key hash directly).
+    CREATE TABLE IF NOT EXISTS outbound_hashes (
+      hash TEXT PRIMARY KEY,
+      sent_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_outbound_hashes_sent_at ON outbound_hashes(sent_at);
 
     CREATE TABLE IF NOT EXISTS jid_links (
       secondary_jid TEXT PRIMARY KEY,
@@ -899,6 +912,130 @@ export function getDeadLetterQueue(): DeadLetterEntry[] {
   return db
     .prepare(`SELECT * FROM dead_letter_queue ORDER BY failed_at DESC`)
     .all() as DeadLetterEntry[];
+}
+
+// --- Outbound dedup (RISK-013 Chunk 3) ---
+//
+// Rolling 15-min bucket + 8-bucket (120min) lookback. 120min safely exceeds
+// the current QUEUE_HARD_TIMEOUT (90min) with margin and continues to cover
+// the post-1b 60min number, so this window does NOT need re-tuning when 1b
+// lands. Wider than v2.1's 30min because Jul9→10 recurrences were
+// ~22min-spaced repeats over ~90min — at/past the edge of a 30min window.
+//
+// Tradeoff (accepted): a legitimate short repeat of the exact same text
+// within 2h is uncommon in practice and, if it occurs, visible to Lucas (no
+// response arrives, he can repeat). Contrast with the failure mode this
+// window closes — an invisible silent re-run burning tokens with zero
+// output — which is strictly worse.
+const BUCKET_MS = 15 * 60 * 1000;
+const LOOKBACK_BUCKETS = 8; // 8 * 15min = 120min
+
+// 24h TTL for table hygiene only (correctness window is LOOKBACK_BUCKETS
+// above; this is unrelated and much longer). Cleanup runs opportunistically
+// on every insert to avoid a separate scheduled worker — outbound sends
+// aren't high-frequency enough for an indexed DELETE per insert to matter.
+const OUTBOUND_HASH_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Normalize outbound text before hashing. Deliberately explicit:
+ *   - trim leading/trailing whitespace
+ *   - collapse internal whitespace runs to a single space
+ * Deliberately NOT included: no lowercasing (case is meaningful); no
+ * punctuation stripping (trailing "." vs "" is meaningful). Written down
+ * here so implementation doesn't silently drift.
+ */
+export function normalizeOutbound(text: string): string {
+  return text.trim().replace(/\s+/g, ' ');
+}
+
+function hashOutbound(
+  groupJid: string,
+  normalized: string,
+  bucket: number,
+): string {
+  return createHash('sha256')
+    .update(`${groupJid}:${bucket}:${normalized}`)
+    .digest('hex');
+}
+
+function outboundDedupCandidateHashes(
+  groupJid: string,
+  normalized: string,
+  sentAt: number,
+): string[] {
+  const currentBucket = Math.floor(sentAt / BUCKET_MS);
+  const hashes: string[] = [];
+  for (let k = 0; k < LOOKBACK_BUCKETS; k++) {
+    hashes.push(hashOutbound(groupJid, normalized, currentBucket - k));
+  }
+  return hashes;
+}
+
+/**
+ * Returns the MOST RECENT prior send's `sent_at` (ms epoch) if `normalized`
+ * is a duplicate within the LOOKBACK_BUCKETS window, or `null` if it is not.
+ * Callers use `=== null` as the "not a duplicate" test.
+ *
+ * MAX (not MIN): callers use the return value to compute how long since the
+ * PREVIOUS occurrence, so they can gate an ops alert on "5+ min since the
+ * most recent copy" (long-backoff retry storms won't false-alert on their
+ * tail). See v2.4 review + Lucas's MIN→MAX decision.
+ *
+ * v2.4 fix 1: wrapped in try/catch and FAILS OPEN. A DB error here (locked
+ * file, disk issue, etc.) must never abort what could be a real,
+ * safety-critical send further up the call chain — the caller treats a
+ * null return as "not a duplicate" and proceeds to channel.sendMessage
+ * exactly as it would on a genuine cache miss. Worst case of a DB hiccup:
+ * one send loses dedup coverage. Strictly preferable to a real send being
+ * silently aborted.
+ */
+export function checkOutboundDedup(
+  groupJid: string,
+  normalized: string,
+  sentAt: number,
+): number | null {
+  try {
+    const candidates = outboundDedupCandidateHashes(groupJid, normalized, sentAt);
+    const placeholders = candidates.map(() => '?').join(', ');
+    const row = db
+      .prepare(
+        `SELECT MAX(sent_at) AS sent_at FROM outbound_hashes WHERE hash IN (${placeholders})`,
+      )
+      .get(...candidates) as { sent_at: number | null } | undefined;
+    return row?.sent_at ?? null;
+  } catch (err) {
+    logger.warn(
+      { err, groupJid },
+      'checkOutboundDedup: lookup failed, failing open (treating as not-duplicate so the send proceeds)',
+    );
+    return null;
+  }
+}
+
+/**
+ * Record the hash of a genuinely-delivered outbound send. Call ONLY after
+ * confirmed delivery (outputSentToUser = true, saveState() persisted).
+ * v2.4 fix 2 constraint: never called before the delivery is settled — a
+ * throw here must not roll back an already-persisted send. The caller
+ * wraps this in a try/catch that swallows write errors and logs WARN;
+ * worst case is one send loses dedup coverage for future retries.
+ *
+ * Opportunistic TTL cleanup piggybacks on the insert — no separate worker.
+ * Cheap because outbound sends aren't frequent enough for the indexed
+ * DELETE to matter.
+ */
+export function recordOutboundSendHash(
+  groupJid: string,
+  normalized: string,
+  sentAt: number,
+): void {
+  const currentBucket = Math.floor(sentAt / BUCKET_MS);
+  db.prepare(
+    `INSERT OR IGNORE INTO outbound_hashes (hash, sent_at) VALUES (?, ?)`,
+  ).run(hashOutbound(groupJid, normalized, currentBucket), sentAt);
+  db.prepare(`DELETE FROM outbound_hashes WHERE sent_at < ?`).run(
+    sentAt - OUTBOUND_HASH_TTL_MS,
+  );
 }
 
 // --- JID Linking (channel unification) ---
