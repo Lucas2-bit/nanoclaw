@@ -100,7 +100,13 @@ export class GroupQueue {
     | ((groupJid: string) => Promise<ProcessResult>)
     | null = null;
   private notifyMainFn?: (text: string) => Promise<void>;
-  private requeueFn?: (groupJid: string) => void;
+  // RISK-013 Chunk 5a — requeueFn now receives priorGeneration (the value of
+  // state.generation captured immediately BEFORE it is incremented in the
+  // timeout branch, i.e. the generation the just-timed-out invocation was
+  // running under). The callback uses it to look up outputSentThisRun with a
+  // (primaryJid, generation)-qualified key, so an overlapping newer run for
+  // the same primaryJid can never read or clobber an older invocation's slot.
+  private requeueFn?: (groupJid: string, priorGeneration: number) => void;
   private shuttingDown = false;
   // Tracks the start time (ms) of the oldest currently-active run.
   // null when activeCount === 0.
@@ -260,7 +266,7 @@ export class GroupQueue {
     this.notifyMainFn = fn;
   }
 
-  setRequeueFn(fn: (groupJid: string) => void): void {
+  setRequeueFn(fn: (groupJid: string, priorGeneration: number) => void): void {
     this.requeueFn = fn;
   }
 
@@ -689,8 +695,16 @@ export class GroupQueue {
           this.processMessagesFn(groupJid),
         );
         if (result.status === 'timeout') {
+          // RISK-013 Chunk 5a — capture the generation the just-timed-out
+          // invocation was running under, BEFORE incrementing. This equals
+          // exactly the myGen that invocation snapshotted at its own entry
+          // (index.ts, processGroupMessages ~L594). Passed to requeueFn so
+          // the (primaryJid, generation)-qualified outputSentThisRun lookup
+          // matches this specific invocation's slot, never an overlapping
+          // newer run's.
+          const priorGeneration = state.generation;
           state.generation++;
-          this.requeueFn?.(groupJid);
+          this.requeueFn?.(groupJid, priorGeneration);
           await this.handleHangTimeout(groupJid, state, 'message');
           this.scheduleRetry(groupJid, state);
         } else if (result.status === 'error') {

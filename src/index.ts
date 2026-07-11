@@ -54,6 +54,9 @@ import {
   checkOutboundDedup,
   recordOutboundSendHash,
   normalizeOutbound,
+  checkInboundDedup,
+  recordInboundProcessedHash,
+  normalizeInbound,
   linkJid,
   setRegisteredGroup,
   setRouterState,
@@ -126,7 +129,115 @@ let lastAgentTimestamp: Record<string, string> = {};
  * from the hang-timeout path (which fires outside the run's local scope).
  */
 const previousCursors: Record<string, string> = {};
+
+// RISK-013 Chunk 5a — root-cause race fix for the hang-timeout requeue path.
+//
+// Tracks whether a reply was already sent for a SPECIFIC
+// (primaryJid, generation) run, so requeueFn can distinguish "this exact run
+// hung after replying" (skip rollback — retry would produce a duplicate) from
+// "hung before replying" (roll back as today — retry is the intended
+// behavior). Keyed by generation because state.active is released on
+// timeout-detection before the backgrounded loser necessarily finishes
+// (group-queue.ts finally block) — an overlapping newer run must never read
+// or clobber an older run's slot.
+//
+// Set ONLY at the genuine post-send site (inside `if (delivered)`, after
+// channel.sendMessage confirmed delivery). NEVER set at the outbound-dedup-
+// suppression branch — no send occurs there; if the flag went true on a
+// dedup-hit-with-no-send and the run then hung, requeueFn would incorrectly
+// skip rollback and the batch would be lost.
+//
+// Cleaned up via a try/finally in processGroupMessages so every exit path
+// (normal completion, generation-mismatch early-return, deliver-then-error
+// early-return, uncaught throw) clears the entry — no manual per-path
+// deletes to miss.
+const outputSentThisRun: Record<string, boolean> = {};
+
 let messageLoopRunning = false;
+
+// RISK-013 Chunk 5b — inbound dedup backstop.
+//
+// SAFETY_CRITICAL_PATTERN: a prompt matching any of these terms is NEVER
+// suppressed by the inbound-dedup mechanism, regardless of lookback window
+// or accumulated suppression count. False positives here are NOT harmless
+// (they fully disable the dedup backstop for one batch, exposing us to the
+// duplicate-reply cost this chunk exists to prevent) — but false negatives
+// on family-safety content are categorically worse. Word-boundary anchored
+// throughout to avoid substring collisions (e.g. unanchored 'nut' inside
+// 'minute'). Source list: family_allergens_canonical.md (Oliver: egg, tree
+// nuts, peanuts, erythromycin, amoxicillin, coconut; Alexander: sesame,
+// celery, G6PD — fava/broad beans, primaquine, sulfonamides/co-trimoxazole,
+// nitrofurantoin, ciprofloxacin/quinolones, methylene blue) plus generic
+// safety/medical-emergency terms.
+const SAFETY_CRITICAL_PATTERN = new RegExp(
+  [
+    '\\beggs?\\b',
+    '\\bnuts?\\b',
+    '\\bpeanuts?\\b',
+    '\\bsesame\\b',
+    '\\bcelery\\b',
+    '\\bcoconut\\b',
+    '\\bfava\\b',
+    '\\bfavism\\b',
+    '\\bbroad beans?\\b',
+    '\\berythromycin\\b',
+    '\\bamoxicillin\\b',
+    '\\bprimaquine\\b',
+    '\\bsulfonamides?\\b',
+    '\\bco-?trimoxazole\\b',
+    '\\bnitrofurantoin\\b',
+    '\\bciprofloxacin\\b',
+    '\\bquinolones?\\b',
+    '\\bmethylene blue\\b',
+    '\\bg6pd\\b',
+    '\\ballerg\\w*\\b',
+    '\\banaphyla\\w*\\b',
+    '\\bepi-?pen\\b',
+    '\\bhives?\\b',
+    '\\bswelling\\b',
+    '\\bbreathing\\b',
+    '\\binhaler\\b',
+    '\\bhospital\\b',
+    '\\bemergency\\b',
+    '\\b911\\b',
+    '\\bambulance\\b',
+    '\\bpoison control\\b',
+  ].join('|'),
+  'i',
+);
+
+function isSafetyCriticalPattern(text: string): boolean {
+  return SAFETY_CRITICAL_PATTERN.test(text);
+}
+
+// Edge-triggered inbound-dedup-suppression alert counter, keyed per primaryJid.
+// Increments on every dedup suppression for that primaryJid; fires exactly
+// ONE ops alert on the 2nd suppression (first is silent — matches typical
+// retry-storm cadence). Reset to zero when a genuinely NEW batch completes
+// for the same primaryJid (record site).
+const inboundDedupSuppressionCount = new Map<string, number>();
+
+function maybeAlertInboundDedupSuppression(
+  primaryJid: string,
+  gapMs: number,
+): void {
+  const count = (inboundDedupSuppressionCount.get(primaryJid) ?? 0) + 1;
+  inboundDedupSuppressionCount.set(primaryJid, count);
+  if (count === 2) {
+    routeOpsAlert(
+      `Inbound dedup SUPPRESSED a 2nd re-processing of the same batch for ${primaryJid} ` +
+        `(most recent gap ${Math.round(gapMs / 60000)}min since the original run). This is ` +
+        `likely an active hang-timeout retry storm re-delivering an already-answered batch. ` +
+        `No new container was spawned, no new reply was sent. Review manually.`,
+    ).catch((err) =>
+      logger.warn(
+        { err },
+        'routeOpsAlert failed for inbound-dedup-suppression alert',
+      ),
+    );
+  }
+  // count > 2: intentionally silent — edge-triggered, not per-occurrence.
+}
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -505,6 +616,11 @@ async function processGroupMessages(chatJid: string): Promise<ProcessResult> {
   // path superseded us, or a fresh run started), we must NOT roll back the
   // cursor because the timeout path now owns requeue.
   const myGen = queue.getGeneration(primaryJid);
+  // RISK-013 Chunk 5a — cleanup key for outputSentThisRun. try/finally below
+  // guarantees every exit path (normal returns, early returns, uncaught
+  // throws) clears this run's entry — no manual per-return-site deletes.
+  const runKey = `${primaryJid}:${myGen}`;
+  try {
   const group = registeredGroups[primaryJid];
   if (!group) return { ok: true, ranToCompletion: false };
 
@@ -629,6 +745,39 @@ async function processGroupMessages(chatJid: string): Promise<ProcessResult> {
     lastAgentTimestamp[jid] = lastTs;
   }
 
+  // RISK-013 Chunk 5b — inbound dedup CHECK gate.
+  //
+  // Runs AFTER the cursor-advance block (so a dedup-hit skip inherits the
+  // in-memory cursor advance for free — no special-case rollback needed) and
+  // BEFORE runAgent (so a duplicate batch never even spawns a container).
+  // Safety-critical content bypasses the mechanism entirely (see the
+  // SAFETY_CRITICAL_PATTERN comment above); a false positive here fully
+  // disables dedup for that batch, which is intentionally the safe-fail
+  // direction for family-safety content.
+  //
+  // A dedup hit returns the same no-op-turn shape used elsewhere in this
+  // function (index.ts:509/551/616/638/643) — { ok: true, ranToCompletion:
+  // false } — so the queue treats it as a legitimate no-op, not a failed turn
+  // that would trigger the retry storm this chunk exists to prevent.
+  if (!isSafetyCriticalPattern(prompt)) {
+    const inboundNormalized = normalizeInbound(prompt);
+    const inboundProcessedAt = Date.now();
+    const originalProcessedAt = checkInboundDedup(
+      primaryJid,
+      inboundNormalized,
+      inboundProcessedAt,
+    );
+    if (originalProcessedAt !== null) {
+      const gapMs = inboundProcessedAt - originalProcessedAt;
+      logger.warn(
+        { group: group.name, primaryJid, gapMs },
+        'Inbound dedup: SKIPPING re-processing — this exact batch was already fully processed earlier in the lookback window (likely a hang-timeout retry re-delivering an already-answered batch). No container spawned, no new reply generated.',
+      );
+      maybeAlertInboundDedupSuppression(primaryJid, gapMs);
+      return { ok: true, ranToCompletion: false };
+    }
+  }
+
   logger.info(
     { group: group.name, messageCount: missedMessages.length },
     'Processing messages',
@@ -749,6 +898,12 @@ async function processGroupMessages(chatJid: string): Promise<ProcessResult> {
             // or make unconditional.
             if (delivered) {
               outputSentToUser = true;
+              // RISK-013 Chunk 5a — mark this specific (primaryJid, generation)
+              // run as having sent a real reply. Set here, and ONLY here — the
+              // outbound-dedup-suppression branch above must NEVER set this
+              // flag (no send occurs there; setting it would let requeueFn
+              // skip rollback for a batch that was never actually answered).
+              outputSentThisRun[runKey] = true;
               // Persist cursor now that output was confirmed sent to user
               saveState();
               // Only record the dedup hash AFTER delivery is confirmed and
@@ -763,6 +918,25 @@ async function processGroupMessages(chatJid: string): Promise<ProcessResult> {
                   'recordOutboundSendHash failed; delivery already confirmed and persisted, not rolled back',
                 );
               }
+
+              // RISK-013 Chunk 5b — INBOUND dedup RECORD site.
+              // Records the hash of the just-processed batch so a future
+              // retry of the identical `prompt` (via hang-timeout requeue)
+              // hits the check gate above and skips container spawn entirely.
+              // Re-derives normalizeInbound(prompt) fresh — prompt is closure-
+              // captured as `const` from processGroupMessages's scope, so
+              // this reads the identical value the earlier check gate did.
+              // Errors swallowed by recordInboundProcessedHash itself; run is
+              // not rolled back on hash-write failure.
+              recordInboundProcessedHash(
+                primaryJid,
+                normalizeInbound(prompt),
+                Date.now(),
+              );
+              // Reset the suppression counter for this primaryJid — a
+              // genuinely new batch just completed, so any prior suppression
+              // episode is closed. Next distinct suppression will re-arm.
+              inboundDedupSuppressionCount.delete(primaryJid);
 
               // Voice response: if input had voice messages and channel supports it, send TTS
               if (
@@ -844,6 +1018,15 @@ async function processGroupMessages(chatJid: string): Promise<ProcessResult> {
 
   // Genuine end-to-end completion: a container spawned and delivered output.
   return { ok: true, ranToCompletion: true };
+  } finally {
+    // RISK-013 Chunk 5a — clean up outputSentThisRun on EVERY exit path.
+    // Delete-on-absent-key is a no-op, so this is safe for runs that never
+    // reached the set-site (dedup-hits, early returns before delivery, throws
+    // during setup). Covers the deliver-then-error early return at
+    // `if (outputSentToUser)` above — the exit path panel4's NEW-1 finding
+    // named as leaking under the earlier three-manually-placed-deletes design.
+    delete outputSentThisRun[runKey];
+  }
 }
 
 async function runAgent(
@@ -1573,14 +1756,29 @@ async function main(): Promise<void> {
   // Hang-timeout / D1-D2 alerts are ops/liveness noise — route them to the
   // dedicated OPS_ALERT_JID (or log-only), NEVER to the main user chat.
   queue.setNotifyMainFn(routeOpsAlert);
-  queue.setRequeueFn((primaryJid) => {
+  queue.setRequeueFn((primaryJid, priorGeneration) => {
+    // RISK-013 Chunk 5a — if the invocation that just timed out had already
+    // sent a reply (outputSentThisRun set at its own `if (delivered)` site),
+    // rolling the cursor back would cause the retry to redeliver the same
+    // batch — the Jul-8 00:48 duplicate-reply bug. Skip rollback in that
+    // case; the cursor already advanced at run entry, so the retry's
+    // getMessagesSince picks up only genuinely-new messages.
+    const runKey = `${primaryJid}:${priorGeneration}`;
+    if (outputSentThisRun[runKey]) {
+      delete outputSentThisRun[runKey];
+      logger.info(
+        { jid: primaryJid, generation: priorGeneration },
+        'Hang timeout: reply already sent this run, skipping cursor rollback (5a)',
+      );
+      return;
+    }
     const jids = [primaryJid, ...getSecondaryJids(primaryJid)];
     for (const jid of jids) {
       lastAgentTimestamp[jid] = previousCursors[jid] || '';
     }
     saveState();
     logger.info(
-      { jid: primaryJid },
+      { jid: primaryJid, generation: priorGeneration },
       'Hang timeout: cursor rolled back for requeue',
     );
   });

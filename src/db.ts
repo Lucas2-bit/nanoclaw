@@ -107,6 +107,18 @@ function createSchema(database: Database.Database): void {
       sent_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_outbound_hashes_sent_at ON outbound_hashes(sent_at);
+    -- RISK-013 Chunk 5b — INBOUND-side dedup backstop. Records hash of every
+    -- fully-processed batch (at outputSentToUser=true). Retries of an already-
+    -- answered batch (hang/kill/retry-storm) hit the check gate BEFORE runAgent
+    -- and skip the entire container spawn — catches the Jul-8 00:48-style
+    -- pattern (duplicated inbound, distinct outbound each time) that Chunk 3's
+    -- outbound-hash dedup cannot see. See specs/risk-013-chunk5-inbound-dedup-v7.md.
+    CREATE TABLE IF NOT EXISTS inbound_processed_hashes (
+      hash TEXT PRIMARY KEY,
+      chat_jid TEXT NOT NULL,
+      processed_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_inbound_processed_hashes_processed_at ON inbound_processed_hashes(processed_at);
 
     CREATE TABLE IF NOT EXISTS jid_links (
       secondary_jid TEXT PRIMARY KEY,
@@ -1040,6 +1052,115 @@ export function recordOutboundSendHash(
   db.prepare(`DELETE FROM outbound_hashes WHERE sent_at < ?`).run(
     sentAt - OUTBOUND_HASH_TTL_MS,
   );
+}
+
+// --- Inbound dedup (RISK-013 Chunk 5b) ---
+//
+// Records the hash of every fully-processed inbound batch (at
+// outputSentToUser = true inside processGroupMessages). A retry that lands the
+// same batch again — the Jul-8 00:48 pattern where a hang-timeout requeue
+// re-delivers content the earlier run already answered — hits the check gate
+// BEFORE runAgent is invoked and skips the entire container spawn.
+//
+// Same 15-min bucket / 120-min lookback as Chunk 3's outbound-dedup —
+// deliberate reuse: same failure surface, no confirmed evidence inbound
+// retries span a different timescale. Fails OPEN on DB error.
+const INBOUND_BUCKET_MS = 15 * 60 * 1000;
+const INBOUND_LOOKBACK_BUCKETS = 8; // 8 * 15min = 120min
+const INBOUND_HASH_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Normalize inbound text before hashing. Identical to normalizeOutbound —
+ * see there for the deliberate NOT-lowercased / NOT-punctuation-stripped
+ * design decision.
+ */
+export function normalizeInbound(text: string): string {
+  return text.trim().replace(/\s+/g, ' ');
+}
+
+function inboundHash(
+  primaryJid: string,
+  normalized: string,
+  bucket: number,
+): string {
+  return createHash('sha256')
+    .update(JSON.stringify([primaryJid, bucket, normalized]))
+    .digest('hex');
+}
+
+function inboundDedupCandidateHashes(
+  primaryJid: string,
+  normalized: string,
+  processedAt: number,
+): string[] {
+  const currentBucket = Math.floor(processedAt / INBOUND_BUCKET_MS);
+  const hashes: string[] = [];
+  for (let k = 0; k < INBOUND_LOOKBACK_BUCKETS; k++) {
+    hashes.push(inboundHash(primaryJid, normalized, currentBucket - k));
+  }
+  return hashes;
+}
+
+/**
+ * Returns MIN(processed_at) (ms epoch) if `normalized` is a duplicate within
+ * the lookback window, or null otherwise. Fails OPEN on any DB error — a
+ * lookup fault must never block a real inbound send from proceeding.
+ */
+export function checkInboundDedup(
+  primaryJid: string,
+  normalized: string,
+  processedAt: number,
+): number | null {
+  try {
+    const candidates = inboundDedupCandidateHashes(
+      primaryJid,
+      normalized,
+      processedAt,
+    );
+    const placeholders = candidates.map(() => '?').join(', ');
+    const row = db
+      .prepare(
+        `SELECT MIN(processed_at) AS processed_at FROM inbound_processed_hashes WHERE hash IN (${placeholders})`,
+      )
+      .get(...candidates) as { processed_at: number | null } | undefined;
+    return row?.processed_at ?? null;
+  } catch (err) {
+    logger.warn(
+      { err, primaryJid },
+      'checkInboundDedup: lookup failed, failing open',
+    );
+    return null;
+  }
+}
+
+/**
+ * Records that this exact batch has been fully processed. Call ONLY after
+ * outputSentToUser = true. Errors are logged and swallowed — a hash write
+ * fault must never roll back a delivery that already happened.
+ */
+export function recordInboundProcessedHash(
+  primaryJid: string,
+  normalized: string,
+  processedAt: number,
+): void {
+  try {
+    const currentBucket = Math.floor(processedAt / INBOUND_BUCKET_MS);
+    db.prepare(
+      `INSERT OR IGNORE INTO inbound_processed_hashes (hash, chat_jid, processed_at) VALUES (?, ?, ?)`,
+    ).run(
+      inboundHash(primaryJid, normalized, currentBucket),
+      primaryJid,
+      processedAt,
+    );
+    db.prepare(
+      `DELETE FROM inbound_processed_hashes WHERE processed_at < ?`,
+    ).run(processedAt - INBOUND_HASH_TTL_MS);
+  } catch (err) {
+    logger.warn(
+      { err, primaryJid },
+      'recordInboundProcessedHash failed; run already completed and is not rolled back',
+    );
+  }
 }
 
 // --- JID Linking (channel unification) ---
