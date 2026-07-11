@@ -621,403 +621,409 @@ async function processGroupMessages(chatJid: string): Promise<ProcessResult> {
   // throws) clears this run's entry — no manual per-return-site deletes.
   const runKey = `${primaryJid}:${myGen}`;
   try {
-  const group = registeredGroups[primaryJid];
-  if (!group) return { ok: true, ranToCompletion: false };
+    const group = registeredGroups[primaryJid];
+    if (!group) return { ok: true, ranToCompletion: false };
 
-  // Collect messages from the primary JID AND all linked secondary JIDs.
-  // Messages are stored under their original JID, so we must check all of them.
-  const allJids = [primaryJid, ...getSecondaryJids(primaryJid)];
-  let missedMessages: NewMessage[] = [];
-  let activeChannel: Channel | undefined;
-  let activeChatJid = chatJid; // the JID whose channel we'll reply through
+    // Collect messages from the primary JID AND all linked secondary JIDs.
+    // Messages are stored under their original JID, so we must check all of them.
+    const allJids = [primaryJid, ...getSecondaryJids(primaryJid)];
+    let missedMessages: NewMessage[] = [];
+    let activeChannel: Channel | undefined;
+    let activeChatJid = chatJid; // the JID whose channel we'll reply through
 
-  for (const jid of allJids) {
-    const msgs = getMessagesSince(
-      jid,
-      getOrRecoverCursor(jid),
-      ASSISTANT_NAME,
-      MAX_MESSAGES_PER_PROMPT,
-    );
-    if (msgs.length > 0) {
-      missedMessages.push(...msgs);
-      // Use the channel of the JID that actually has messages for replies
-      const ch = findChannel(channels, jid);
-      if (ch) {
-        activeChannel = ch;
-        activeChatJid = jid;
-      }
-    }
-  }
-
-  // Sort by timestamp in case messages came from multiple channels
-  missedMessages.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-
-  // Trim to max
-  if (missedMessages.length > MAX_MESSAGES_PER_PROMPT) {
-    missedMessages = missedMessages.slice(-MAX_MESSAGES_PER_PROMPT);
-  }
-
-  const hasVoiceInput = missedMessages.some(
-    (m) => m.content.startsWith('[Voice:') && !m.is_from_me,
-  );
-
-  const channel = activeChannel || findChannel(channels, chatJid);
-  if (!channel) {
-    logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
-    return { ok: true, ranToCompletion: false };
-  }
-
-  const isMainGroup = group.isMain === true;
-
-  if (missedMessages.length === 0) return { ok: true, ranToCompletion: false };
-
-  // --- Session command interception (before trigger check) ---
-  const isPrivateChat = !isMainGroup && group.requiresTrigger === false;
-  const cmdResult = await handleSessionCommand({
-    missedMessages,
-    isMainGroup,
-    isPrivateChat,
-    groupName: group.name,
-    triggerPattern: getTriggerPattern(group.trigger),
-    timezone: TIMEZONE,
-    deps: {
-      sendMessage: (text) => channel.sendMessage(activeChatJid, text),
-      setTyping: (typing) =>
-        channel.setTyping?.(activeChatJid, typing) ?? Promise.resolve(),
-      runAgent: (prompt, onOutput) =>
-        runAgent(group, prompt, activeChatJid, [], onOutput),
-      closeStdin: () => queue.closeStdin(primaryJid),
-      advanceCursor: (ts) => {
-        // Advance cursor for ALL linked JIDs so messages aren't re-fetched
-        for (const jid of allJids) {
-          lastAgentTimestamp[jid] = ts;
+    for (const jid of allJids) {
+      const msgs = getMessagesSince(
+        jid,
+        getOrRecoverCursor(jid),
+        ASSISTANT_NAME,
+        MAX_MESSAGES_PER_PROMPT,
+      );
+      if (msgs.length > 0) {
+        missedMessages.push(...msgs);
+        // Use the channel of the JID that actually has messages for replies
+        const ch = findChannel(channels, jid);
+        if (ch) {
+          activeChannel = ch;
+          activeChatJid = jid;
         }
-        saveState();
-      },
-      formatMessages,
-      canSenderInteract: (msg) => {
-        const hasTrigger = getTriggerPattern(group.trigger).test(
-          msg.content.trim(),
-        );
-        const reqTrigger = !isMainGroup && group.requiresTrigger !== false;
-        return (
-          isMainGroup ||
-          !reqTrigger ||
-          (hasTrigger &&
-            (msg.is_from_me ||
-              isTriggerAllowed(
-                activeChatJid,
-                msg.sender,
-                loadSenderAllowlist(),
-              )))
-        );
-      },
-    },
-  });
-  if (cmdResult.handled)
-    return { ok: cmdResult.success, ranToCompletion: false };
-  // --- End session command interception ---
-
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
-    const triggerPattern = getTriggerPattern(group.trigger);
-    const allowlistCfg = loadSenderAllowlist();
-    const hasTrigger = missedMessages.some(
-      (m) =>
-        triggerPattern.test(m.content.trim()) &&
-        (m.is_from_me ||
-          isTriggerAllowed(activeChatJid, m.sender, allowlistCfg)),
-    );
-    if (!hasTrigger) {
-      return { ok: true, ranToCompletion: false };
-    }
-  }
-
-  const prompt = formatMessages(missedMessages, TIMEZONE);
-  const imageAttachments = parseImageReferences(missedMessages);
-
-  // Advance cursor for ALL linked JIDs so messages aren't re-fetched.
-  // previousCursors is module-scope (see top of file) so the queue's requeue
-  // callback can roll back from the hang-timeout path.
-  const lastTs = missedMessages[missedMessages.length - 1].timestamp;
-  for (const jid of allJids) {
-    previousCursors[jid] = lastAgentTimestamp[jid] || '';
-    lastAgentTimestamp[jid] = lastTs;
-  }
-
-  // RISK-013 Chunk 5b — inbound dedup CHECK gate.
-  //
-  // Runs AFTER the cursor-advance block (so a dedup-hit skip inherits the
-  // in-memory cursor advance for free — no special-case rollback needed) and
-  // BEFORE runAgent (so a duplicate batch never even spawns a container).
-  // Safety-critical content bypasses the mechanism entirely (see the
-  // SAFETY_CRITICAL_PATTERN comment above); a false positive here fully
-  // disables dedup for that batch, which is intentionally the safe-fail
-  // direction for family-safety content.
-  //
-  // A dedup hit returns the same no-op-turn shape used elsewhere in this
-  // function (index.ts:509/551/616/638/643) — { ok: true, ranToCompletion:
-  // false } — so the queue treats it as a legitimate no-op, not a failed turn
-  // that would trigger the retry storm this chunk exists to prevent.
-  if (!isSafetyCriticalPattern(prompt)) {
-    const inboundNormalized = normalizeInbound(prompt);
-    const inboundProcessedAt = Date.now();
-    const originalProcessedAt = checkInboundDedup(
-      primaryJid,
-      inboundNormalized,
-      inboundProcessedAt,
-    );
-    if (originalProcessedAt !== null) {
-      const gapMs = inboundProcessedAt - originalProcessedAt;
-      logger.warn(
-        { group: group.name, primaryJid, gapMs },
-        'Inbound dedup: SKIPPING re-processing — this exact batch was already fully processed earlier in the lookback window (likely a hang-timeout retry re-delivering an already-answered batch). No container spawned, no new reply generated.',
-      );
-      maybeAlertInboundDedupSuppression(primaryJid, gapMs);
-      return { ok: true, ranToCompletion: false };
-    }
-  }
-
-  logger.info(
-    { group: group.name, messageCount: missedMessages.length },
-    'Processing messages',
-  );
-
-  // Track idle timer for closing stdin when agent is idle
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const resetIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      logger.debug(
-        { group: group.name },
-        'Idle timeout, closing container stdin',
-      );
-      queue.closeStdin(primaryJid);
-    }, IDLE_TIMEOUT);
-  };
-
-  await channel.setTyping?.(activeChatJid, true);
-  let hadError = false;
-  let outputSentToUser = false;
-
-  const output = await runAgent(
-    group,
-    prompt,
-    activeChatJid,
-    imageAttachments,
-    async (result) => {
-      // Streaming output callback — called for each agent result
-      if (result.status === 'keepalive') {
-        resetIdleTimer();
-        return;
       }
-      if (result.result) {
-        const raw =
-          typeof result.result === 'string'
-            ? result.result
-            : JSON.stringify(result.result);
-        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-        logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-        if (text) {
-          // RISK-013 Chunk 3 (v2.4) — outbound dedup with cursor-safe semantics.
-          //
-          // checkOutboundDedup returns MAX(sent_at) of any prior send with the
-          // same normalized content within the LOOKBACK_BUCKETS window, or
-          // null (meaning: not a duplicate OR the lookup failed and it's
-          // failing open). Both null cases correctly fall through to the real
-          // send path below.
-          //
-          // A dedup-hit is NOT a failure. The content was genuinely delivered
-          // earlier in the window (that earlier send is what wrote the hash
-          // this lookup just matched). Treat it as a SUCCESS for cursor
-          // purposes — advance and persist — but skip actually re-sending.
-          const sentAt = Date.now();
-          const normalized = normalizeOutbound(text);
-          const originalSentAt = checkOutboundDedup(
-            activeChatJid,
-            normalized,
-            sentAt,
+    }
+
+    // Sort by timestamp in case messages came from multiple channels
+    missedMessages.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+    // Trim to max
+    if (missedMessages.length > MAX_MESSAGES_PER_PROMPT) {
+      missedMessages = missedMessages.slice(-MAX_MESSAGES_PER_PROMPT);
+    }
+
+    const hasVoiceInput = missedMessages.some(
+      (m) => m.content.startsWith('[Voice:') && !m.is_from_me,
+    );
+
+    const channel = activeChannel || findChannel(channels, chatJid);
+    if (!channel) {
+      logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+      return { ok: true, ranToCompletion: false };
+    }
+
+    const isMainGroup = group.isMain === true;
+
+    if (missedMessages.length === 0)
+      return { ok: true, ranToCompletion: false };
+
+    // --- Session command interception (before trigger check) ---
+    const isPrivateChat = !isMainGroup && group.requiresTrigger === false;
+    const cmdResult = await handleSessionCommand({
+      missedMessages,
+      isMainGroup,
+      isPrivateChat,
+      groupName: group.name,
+      triggerPattern: getTriggerPattern(group.trigger),
+      timezone: TIMEZONE,
+      deps: {
+        sendMessage: (text) => channel.sendMessage(activeChatJid, text),
+        setTyping: (typing) =>
+          channel.setTyping?.(activeChatJid, typing) ?? Promise.resolve(),
+        runAgent: (prompt, onOutput) =>
+          runAgent(group, prompt, activeChatJid, [], onOutput),
+        closeStdin: () => queue.closeStdin(primaryJid),
+        advanceCursor: (ts) => {
+          // Advance cursor for ALL linked JIDs so messages aren't re-fetched
+          for (const jid of allJids) {
+            lastAgentTimestamp[jid] = ts;
+          }
+          saveState();
+        },
+        formatMessages,
+        canSenderInteract: (msg) => {
+          const hasTrigger = getTriggerPattern(group.trigger).test(
+            msg.content.trim(),
           );
-          const isDuplicate = originalSentAt !== null;
+          const reqTrigger = !isMainGroup && group.requiresTrigger !== false;
+          return (
+            isMainGroup ||
+            !reqTrigger ||
+            (hasTrigger &&
+              (msg.is_from_me ||
+                isTriggerAllowed(
+                  activeChatJid,
+                  msg.sender,
+                  loadSenderAllowlist(),
+                )))
+          );
+        },
+      },
+    });
+    if (cmdResult.handled)
+      return { ok: cmdResult.success, ranToCompletion: false };
+    // --- End session command interception ---
 
-          if (isDuplicate) {
-            logger.warn(
-              {
-                group: group.name,
-                chatJid: activeChatJid,
-                gapMs: sentAt - originalSentAt!,
-              },
-              'Outbound dedup: suppressing duplicate send (content already delivered earlier in the lookback window) — treating as a successful send for cursor-persistence purposes',
+    // For non-main groups, check if trigger is required and present
+    if (!isMainGroup && group.requiresTrigger !== false) {
+      const triggerPattern = getTriggerPattern(group.trigger);
+      const allowlistCfg = loadSenderAllowlist();
+      const hasTrigger = missedMessages.some(
+        (m) =>
+          triggerPattern.test(m.content.trim()) &&
+          (m.is_from_me ||
+            isTriggerAllowed(activeChatJid, m.sender, allowlistCfg)),
+      );
+      if (!hasTrigger) {
+        return { ok: true, ranToCompletion: false };
+      }
+    }
+
+    const prompt = formatMessages(missedMessages, TIMEZONE);
+    const imageAttachments = parseImageReferences(missedMessages);
+
+    // Advance cursor for ALL linked JIDs so messages aren't re-fetched.
+    // previousCursors is module-scope (see top of file) so the queue's requeue
+    // callback can roll back from the hang-timeout path.
+    const lastTs = missedMessages[missedMessages.length - 1].timestamp;
+    for (const jid of allJids) {
+      previousCursors[jid] = lastAgentTimestamp[jid] || '';
+      lastAgentTimestamp[jid] = lastTs;
+    }
+
+    // RISK-013 Chunk 5b — inbound dedup CHECK gate.
+    //
+    // Runs AFTER the cursor-advance block (so a dedup-hit skip inherits the
+    // in-memory cursor advance for free — no special-case rollback needed) and
+    // BEFORE runAgent (so a duplicate batch never even spawns a container).
+    // Safety-critical content bypasses the mechanism entirely (see the
+    // SAFETY_CRITICAL_PATTERN comment above); a false positive here fully
+    // disables dedup for that batch, which is intentionally the safe-fail
+    // direction for family-safety content.
+    //
+    // A dedup hit returns the same no-op-turn shape used elsewhere in this
+    // function (index.ts:509/551/616/638/643) — { ok: true, ranToCompletion:
+    // false } — so the queue treats it as a legitimate no-op, not a failed turn
+    // that would trigger the retry storm this chunk exists to prevent.
+    if (!isSafetyCriticalPattern(prompt)) {
+      const inboundNormalized = normalizeInbound(prompt);
+      const inboundProcessedAt = Date.now();
+      const originalProcessedAt = checkInboundDedup(
+        primaryJid,
+        inboundNormalized,
+        inboundProcessedAt,
+      );
+      if (originalProcessedAt !== null) {
+        const gapMs = inboundProcessedAt - originalProcessedAt;
+        logger.warn(
+          { group: group.name, primaryJid, gapMs },
+          'Inbound dedup: SKIPPING re-processing — this exact batch was already fully processed earlier in the lookback window (likely a hang-timeout retry re-delivering an already-answered batch). No container spawned, no new reply generated.',
+        );
+        maybeAlertInboundDedupSuppression(primaryJid, gapMs);
+        return { ok: true, ranToCompletion: false };
+      }
+    }
+
+    logger.info(
+      { group: group.name, messageCount: missedMessages.length },
+      'Processing messages',
+    );
+
+    // Track idle timer for closing stdin when agent is idle
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        logger.debug(
+          { group: group.name },
+          'Idle timeout, closing container stdin',
+        );
+        queue.closeStdin(primaryJid);
+      }, IDLE_TIMEOUT);
+    };
+
+    await channel.setTyping?.(activeChatJid, true);
+    let hadError = false;
+    let outputSentToUser = false;
+
+    const output = await runAgent(
+      group,
+      prompt,
+      activeChatJid,
+      imageAttachments,
+      async (result) => {
+        // Streaming output callback — called for each agent result
+        if (result.status === 'keepalive') {
+          resetIdleTimer();
+          return;
+        }
+        if (result.result) {
+          const raw =
+            typeof result.result === 'string'
+              ? result.result
+              : JSON.stringify(result.result);
+          // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+          const text = raw
+            .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+            .trim();
+          logger.info(
+            { group: group.name },
+            `Agent output: ${raw.length} chars`,
+          );
+          if (text) {
+            // RISK-013 Chunk 3 (v2.4) — outbound dedup with cursor-safe semantics.
+            //
+            // checkOutboundDedup returns MAX(sent_at) of any prior send with the
+            // same normalized content within the LOOKBACK_BUCKETS window, or
+            // null (meaning: not a duplicate OR the lookup failed and it's
+            // failing open). Both null cases correctly fall through to the real
+            // send path below.
+            //
+            // A dedup-hit is NOT a failure. The content was genuinely delivered
+            // earlier in the window (that earlier send is what wrote the hash
+            // this lookup just matched). Treat it as a SUCCESS for cursor
+            // purposes — advance and persist — but skip actually re-sending.
+            const sentAt = Date.now();
+            const normalized = normalizeOutbound(text);
+            const originalSentAt = checkOutboundDedup(
+              activeChatJid,
+              normalized,
+              sentAt,
             );
-            outputSentToUser = true;
-            saveState();
-            // Do NOT call recordOutboundSendHash here — the hash was already
-            // recorded on the original send; recording again would refresh
-            // its timestamp for no reason.
+            const isDuplicate = originalSentAt !== null;
 
-            // Time-gap-triggered ops alert. Retry-storm duplicates repeat
-            // within SECONDS of the original (the failure pattern this chunk
-            // exists to fix); an intentional human-driven resend of urgent
-            // content would land much later. Gating on a 5-min gap keeps the
-            // common case (retry-storm dupe) silent — so this doesn't
-            // recreate the ~56-alerts/day spam pattern that motivated
-            // RISK-013 in the first place. MAX(sent_at) semantics (not MIN)
-            // mean this is "5min since the MOST RECENT copy" — resistant to
-            // long-backoff retry-storm tails false-alerting.
-            const gapMs = sentAt - originalSentAt!;
-            const DEDUP_ALERT_GAP_THRESHOLD_MS = 5 * 60 * 1000;
-            if (gapMs > DEDUP_ALERT_GAP_THRESHOLD_MS) {
-              routeOpsAlert(
-                `Outbound dedup SUPPRESSED a duplicate send to ${activeChatJid}, ` +
-                  `${Math.round(gapMs / 60000)}min after the most recent prior send (over the ` +
-                  `${DEDUP_ALERT_GAP_THRESHOLD_MS / 60000}min retry-storm threshold). This may be ` +
-                  `an intentional resend (e.g. an unacknowledged safety-critical message) ` +
-                  `that was silently swallowed instead of delivered. Content was NOT re-sent. ` +
-                  `Review manually.`,
-              ).catch((err) =>
-                logger.warn(
-                  { err },
-                  'routeOpsAlert failed for dedup-suppression alert',
-                ),
+            if (isDuplicate) {
+              logger.warn(
+                {
+                  group: group.name,
+                  chatJid: activeChatJid,
+                  gapMs: sentAt - originalSentAt!,
+                },
+                'Outbound dedup: suppressing duplicate send (content already delivered earlier in the lookback window) — treating as a successful send for cursor-persistence purposes',
               );
-            }
-          } else {
-            let delivered = false;
-            try {
-              delivered = await channel.sendMessage(activeChatJid, text);
-            } catch (err) {
-              recordSendFailure(activeChatJid, text, group.folder, err);
-              throw err; // re-throw so the caller still sees the error
-            }
-            // UNCHANGED by RISK-013 v2.4: `delivered` can be false without
-            // throwing (allergen-safety backstop, queued-while-disconnected,
-            // etc). This gate is load-bearing and family-safety-adjacent —
-            // see specs/risk-013-v2.3-chunk3-panel-check.md. Do NOT remove
-            // or make unconditional.
-            if (delivered) {
               outputSentToUser = true;
-              // RISK-013 Chunk 5a — mark this specific (primaryJid, generation)
-              // run as having sent a real reply. Set here, and ONLY here — the
-              // outbound-dedup-suppression branch above must NEVER set this
-              // flag (no send occurs there; setting it would let requeueFn
-              // skip rollback for a batch that was never actually answered).
-              outputSentThisRun[runKey] = true;
-              // Persist cursor now that output was confirmed sent to user
               saveState();
-              // Only record the dedup hash AFTER delivery is confirmed and
-              // persisted. Wrapped in try/catch so a DB write failure here
-              // can never undo an already-settled send. Worst case of a
-              // swallowed error: one send loses dedup coverage.
-              try {
-                recordOutboundSendHash(activeChatJid, normalized, sentAt);
-              } catch (err) {
-                logger.warn(
-                  { err, chatJid: activeChatJid },
-                  'recordOutboundSendHash failed; delivery already confirmed and persisted, not rolled back',
+              // Do NOT call recordOutboundSendHash here — the hash was already
+              // recorded on the original send; recording again would refresh
+              // its timestamp for no reason.
+
+              // Time-gap-triggered ops alert. Retry-storm duplicates repeat
+              // within SECONDS of the original (the failure pattern this chunk
+              // exists to fix); an intentional human-driven resend of urgent
+              // content would land much later. Gating on a 5-min gap keeps the
+              // common case (retry-storm dupe) silent — so this doesn't
+              // recreate the ~56-alerts/day spam pattern that motivated
+              // RISK-013 in the first place. MAX(sent_at) semantics (not MIN)
+              // mean this is "5min since the MOST RECENT copy" — resistant to
+              // long-backoff retry-storm tails false-alerting.
+              const gapMs = sentAt - originalSentAt!;
+              const DEDUP_ALERT_GAP_THRESHOLD_MS = 5 * 60 * 1000;
+              if (gapMs > DEDUP_ALERT_GAP_THRESHOLD_MS) {
+                routeOpsAlert(
+                  `Outbound dedup SUPPRESSED a duplicate send to ${activeChatJid}, ` +
+                    `${Math.round(gapMs / 60000)}min after the most recent prior send (over the ` +
+                    `${DEDUP_ALERT_GAP_THRESHOLD_MS / 60000}min retry-storm threshold). This may be ` +
+                    `an intentional resend (e.g. an unacknowledged safety-critical message) ` +
+                    `that was silently swallowed instead of delivered. Content was NOT re-sent. ` +
+                    `Review manually.`,
+                ).catch((err) =>
+                  logger.warn(
+                    { err },
+                    'routeOpsAlert failed for dedup-suppression alert',
+                  ),
                 );
               }
-
-              // RISK-013 Chunk 5b — INBOUND dedup RECORD site.
-              // Records the hash of the just-processed batch so a future
-              // retry of the identical `prompt` (via hang-timeout requeue)
-              // hits the check gate above and skips container spawn entirely.
-              // Re-derives normalizeInbound(prompt) fresh — prompt is closure-
-              // captured as `const` from processGroupMessages's scope, so
-              // this reads the identical value the earlier check gate did.
-              // Errors swallowed by recordInboundProcessedHash itself; run is
-              // not rolled back on hash-write failure.
-              recordInboundProcessedHash(
-                primaryJid,
-                normalizeInbound(prompt),
-                Date.now(),
-              );
-              // Reset the suppression counter for this primaryJid — a
-              // genuinely new batch just completed, so any prior suppression
-              // episode is closed. Next distinct suppression will re-arm.
-              inboundDedupSuppressionCount.delete(primaryJid);
-
-              // Voice response: if input had voice messages and channel supports it, send TTS
-              if (
-                hasVoiceInput &&
-                channel.sendVoiceNote &&
-                group.voiceEnabled
-              ) {
+            } else {
+              let delivered = false;
+              try {
+                delivered = await channel.sendMessage(activeChatJid, text);
+              } catch (err) {
+                recordSendFailure(activeChatJid, text, group.folder, err);
+                throw err; // re-throw so the caller still sees the error
+              }
+              // UNCHANGED by RISK-013 v2.4: `delivered` can be false without
+              // throwing (allergen-safety backstop, queued-while-disconnected,
+              // etc). This gate is load-bearing and family-safety-adjacent —
+              // see specs/risk-013-v2.3-chunk3-panel-check.md. Do NOT remove
+              // or make unconditional.
+              if (delivered) {
+                outputSentToUser = true;
+                // RISK-013 Chunk 5a — mark this specific (primaryJid, generation)
+                // run as having sent a real reply. Set here, and ONLY here — the
+                // outbound-dedup-suppression branch above must NEVER set this
+                // flag (no send occurs there; setting it would let requeueFn
+                // skip rollback for a batch that was never actually answered).
+                outputSentThisRun[runKey] = true;
+                // Persist cursor now that output was confirmed sent to user
+                saveState();
+                // Only record the dedup hash AFTER delivery is confirmed and
+                // persisted. Wrapped in try/catch so a DB write failure here
+                // can never undo an already-settled send. Worst case of a
+                // swallowed error: one send loses dedup coverage.
                 try {
-                  const audioBuffer = await generateSpeech(text);
-                  if (audioBuffer) {
-                    await channel.sendVoiceNote(activeChatJid, audioBuffer);
-                    logger.info(
-                      { group: group.name, bytes: audioBuffer.length },
-                      'Voice note response sent',
+                  recordOutboundSendHash(activeChatJid, normalized, sentAt);
+                } catch (err) {
+                  logger.warn(
+                    { err, chatJid: activeChatJid },
+                    'recordOutboundSendHash failed; delivery already confirmed and persisted, not rolled back',
+                  );
+                }
+
+                // RISK-013 Chunk 5b — INBOUND dedup RECORD site.
+                // Records the hash of the just-processed batch so a future
+                // retry of the identical `prompt` (via hang-timeout requeue)
+                // hits the check gate above and skips container spawn entirely.
+                // Re-derives normalizeInbound(prompt) fresh — prompt is closure-
+                // captured as `const` from processGroupMessages's scope, so
+                // this reads the identical value the earlier check gate did.
+                // Errors swallowed by recordInboundProcessedHash itself; run is
+                // not rolled back on hash-write failure.
+                recordInboundProcessedHash(
+                  primaryJid,
+                  normalizeInbound(prompt),
+                  Date.now(),
+                );
+                // Reset the suppression counter for this primaryJid — a
+                // genuinely new batch just completed, so any prior suppression
+                // episode is closed. Next distinct suppression will re-arm.
+                inboundDedupSuppressionCount.delete(primaryJid);
+
+                // Voice response: if input had voice messages and channel supports it, send TTS
+                if (
+                  hasVoiceInput &&
+                  channel.sendVoiceNote &&
+                  group.voiceEnabled
+                ) {
+                  try {
+                    const audioBuffer = await generateSpeech(text);
+                    if (audioBuffer) {
+                      await channel.sendVoiceNote(activeChatJid, audioBuffer);
+                      logger.info(
+                        { group: group.name, bytes: audioBuffer.length },
+                        'Voice note response sent',
+                      );
+                    }
+                  } catch (ttsErr) {
+                    logger.warn(
+                      { err: ttsErr },
+                      'TTS voice response failed - text was sent',
                     );
                   }
-                } catch (ttsErr) {
-                  logger.warn(
-                    { err: ttsErr },
-                    'TTS voice response failed - text was sent',
-                  );
                 }
               }
             }
           }
+          // Only reset idle timer on actual results, not session-update markers (result: null)
+          resetIdleTimer();
         }
-        // Only reset idle timer on actual results, not session-update markers (result: null)
-        resetIdleTimer();
+
+        if (result.status === 'success') {
+          queue.notifyIdle(primaryJid);
+        }
+
+        if (result.status === 'error') {
+          hadError = true;
+        }
+      },
+    );
+
+    await channel.setTyping?.(activeChatJid, false);
+    if (idleTimer) clearTimeout(idleTimer);
+
+    if (output === 'error' || hadError) {
+      // If we already sent output to the user, don't roll back the cursor —
+      // the user got their response and re-processing would send duplicates.
+      if (outputSentToUser) {
+        logger.warn(
+          { group: group.name },
+          'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        );
+        // Output was delivered end-to-end before the error, so this counts as a
+        // genuine completion for the D1 alarm.
+        return { ok: true, ranToCompletion: true };
       }
-
-      if (result.status === 'success') {
-        queue.notifyIdle(primaryJid);
+      if (queue.getGeneration(primaryJid) !== myGen) {
+        logger.info(
+          { jid: primaryJid },
+          'Run superseded by timeout/new run; skipping cursor rollback',
+        );
+        return { ok: false, ranToCompletion: false };
       }
-
-      if (result.status === 'error') {
-        hadError = true;
+      // Roll back cursors for all linked JIDs so retries can re-process
+      for (const jid of allJids) {
+        lastAgentTimestamp[jid] = previousCursors[jid] || '';
       }
-    },
-  );
-
-  await channel.setTyping?.(activeChatJid, false);
-  if (idleTimer) clearTimeout(idleTimer);
-
-  if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
-    if (outputSentToUser) {
+      saveState();
       logger.warn(
         { group: group.name },
-        'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
-      );
-      // Output was delivered end-to-end before the error, so this counts as a
-      // genuine completion for the D1 alarm.
-      return { ok: true, ranToCompletion: true };
-    }
-    if (queue.getGeneration(primaryJid) !== myGen) {
-      logger.info(
-        { jid: primaryJid },
-        'Run superseded by timeout/new run; skipping cursor rollback',
+        'Agent error, rolled back message cursor for retry',
       );
       return { ok: false, ranToCompletion: false };
     }
-    // Roll back cursors for all linked JIDs so retries can re-process
-    for (const jid of allJids) {
-      lastAgentTimestamp[jid] = previousCursors[jid] || '';
+
+    // Agent completed successfully. Persist cursor if not already saved.
+    if (!outputSentToUser) {
+      saveState();
     }
-    saveState();
-    logger.warn(
-      { group: group.name },
-      'Agent error, rolled back message cursor for retry',
-    );
-    return { ok: false, ranToCompletion: false };
-  }
 
-  // Agent completed successfully. Persist cursor if not already saved.
-  if (!outputSentToUser) {
-    saveState();
-  }
-
-  // Genuine end-to-end completion: a container spawned and delivered output.
-  return { ok: true, ranToCompletion: true };
+    // Genuine end-to-end completion: a container spawned and delivered output.
+    return { ok: true, ranToCompletion: true };
   } finally {
     // RISK-013 Chunk 5a — clean up outputSentThisRun on EVERY exit path.
     // Delete-on-absent-key is a no-op, so this is safe for runs that never
