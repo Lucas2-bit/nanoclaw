@@ -65,6 +65,21 @@ RUN printf '#!/bin/bash\nset -e\ncd /app && npx tsc --outDir /tmp/dist 2>&1 >&2\
 # Set ownership to node user (non-root) for writable directories
 RUN chown -R node:node /workspace && chmod 777 /home/node
 
+# Chromium's crash handler (crashpad) calls getpwuid() during init and
+# HARD-TRAPS (SIGTRAP) if the current UID has no /etc/passwd entry — bypasses
+# every sandbox/zygote/single-process flag. This container is run with
+# --user ${hostUid}:${hostGid} on macOS (container-runner.ts sets it whenever
+# host uid != 0 && != 1000) so bind-mount files match the host user's
+# permissions. The base image only ships passwd entries for `root` and
+# `node` (uid 1000) — an unlisted host UID (typically 501 on macOS) leaves
+# getpwuid empty and Chromium traps.
+#
+# Fix: add a passwd entry for uid 501 at build time. Hard-coded for Lucas's
+# personal system; if this container is ever run on a host with a different
+# UID, add another entry below OR generalize via an entrypoint.sh check that
+# appends missing entries with write access preserved.
+RUN echo "runner:x:501:20:macOS host user:/tmp:/bin/bash" >> /etc/passwd
+
 # Switch to non-root user (required for --dangerously-skip-permissions)
 USER node
 
