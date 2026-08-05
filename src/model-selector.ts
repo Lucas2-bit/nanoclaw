@@ -34,6 +34,19 @@ export interface RoutingContext {
   isFormation?: boolean;
   /** Estimated number of tool calls (file reads, searches, etc.) */
   estimatedToolCalls?: number;
+  /** Legal/contract/grievance review work */
+  hasLegalContext?: boolean;
+  /** Deep analytical work (adversarial review, root-cause, threat model, ...) */
+  hasDeepWorkContext?: boolean;
+  /** User explicitly asked for a tier in the message text (see detectSignals) */
+  explicitRequest?: ExplicitRequest | null;
+}
+
+/** An explicit, user-authored model request parsed out of the prompt text. */
+export interface ExplicitRequest {
+  tier: TaskComplexity;
+  /** Which pattern matched — surfaced in the routing log for auditability */
+  via: string;
 }
 
 export interface RoutingDecision {
@@ -74,6 +87,9 @@ interface RoutingConfig {
   defaultComplexity: TaskComplexity;
   scheduledDefaultComplexity?: TaskComplexity;
   scheduledOpusTaskIds?: string[];
+  /** Regex sources (string form) for prompt signal detection. Tunable
+   *  without a rebuild — edit model-routing.json and restart. */
+  signalPatterns?: Record<string, string>;
 }
 
 // ============================================================================
@@ -167,6 +183,115 @@ export function getAllPricing(): Record<string, TokenPricing> {
 }
 
 // ============================================================================
+// Prompt Signal Detection
+// ============================================================================
+
+/**
+ * Fallback patterns, used when model-routing.json omits `signalPatterns` or
+ * ships one that fails to compile. Keeping them here means a malformed config
+ * degrades a single signal rather than disabling routing entirely.
+ */
+const DEFAULT_SIGNAL_PATTERNS: Record<string, string> = {
+  sigil: String.raw`(?:^|\s)!(opus|sonnet|haiku)\b`,
+  requestHeavy: String.raw`\b(?:use|using|used|with|via|run|running|switch(?:ed|ing)?|escalate|escalating|route|bump|upgrade|need(?:s|ed)?|require[sd]?|want(?:s|ed)?|put|do)\b[^.!?\n]{0,24}?\bopus\b`,
+  requestThink: String.raw`\b(?:ultra-?think|think(?:ing)? (?:harder|deeper|deeply|carefully)|deep(?:er)? (?:thinking|analysis|dive)|heavy thinking|extended thinking|max(?:imum)? thinking|really think|take your time)\b`,
+  requestImportant: String.raw`\b(?:this|that|it)(?:'s| is| one is)? (?:really |very |extremely |super )?important\b`,
+  requestMedium: String.raw`\b(?:use|with|on|switch to)\s+(?:claude\s+)?sonnet\b`,
+  requestLight: String.raw`\b(?:use|with|on|switch to)\s+(?:claude\s+)?haiku\b`,
+  hasLegalContext: String.raw`\b(?:grievance|lawsuit|attorney|lawyer|litigation|arbitration|deposition|subpoena|non-disclosure|NDA|indemnif|breach of contract|(?:IP|intellectual property) assignment|(?:harassment|discrimination) claim|severance (?:agreement|package)|legal (?:advice|opinion|review)|contract review|review(?:ing)? (?:the |this |a |some |these |those )?(?:contract|agreement)s?)`,
+  hasDeepWorkContext: String.raw`\b(?:adversarial review|root[- ]cause|postmortem|post[- ]mortem|threat model|security (?:review|audit)|architect(?:ure|ing)|design doc|trade[- ]?offs?\b.{0,20}\banalys|migration plan|capacity plan|failure mode|risk assessment|due diligence)`,
+  hasCodeContext: String.raw`\b(file|code|function|class|import|error|bug|src\/|\.ts|\.js|\.py)\b`,
+  isFormation: String.raw`\b(form|formation|parago)\b`,
+  toolVerbs: String.raw`\b(read|search|grep|find|check|look at|review)\b`,
+};
+
+/** Compile each pattern once at startup; fall back per-pattern on error. */
+const SIGNALS: Record<string, RegExp> = (() => {
+  const out: Record<string, RegExp> = {};
+  for (const [name, fallback] of Object.entries(DEFAULT_SIGNAL_PATTERNS)) {
+    const source = config.signalPatterns?.[name] ?? fallback;
+    const flags = name === 'toolVerbs' ? 'gi' : 'i';
+    try {
+      out[name] = new RegExp(source, flags);
+    } catch (err) {
+      logger.warn(
+        { err, signal: name },
+        'Invalid signalPattern in model-routing.json, using built-in default',
+      );
+      out[name] = new RegExp(fallback, flags);
+    }
+  }
+  return out;
+})();
+
+/**
+ * Parse an explicit, user-authored model request out of the prompt.
+ *
+ * Two forms are supported:
+ *   1. Sigil — `!opus` / `!sonnet` / `!haiku`. Unambiguous; always wins.
+ *   2. Natural language — a request verb within a short window of the model
+ *      name ("use opus", "escalate this to Opus", "needs to be Opus"), or a
+ *      thinking-depth phrase ("think harder", "ultrathink", "heavy thinking"),
+ *      or an importance phrase ("this is important").
+ *
+ * The verb window is what keeps *discussing* a model from switching to it —
+ * "the Opus routing bug" and "what does Opus 5 cost?" do not match.
+ *
+ * Downgrades (sonnet/haiku) require the model name to be ADJACENT to the verb.
+ * This asymmetry is deliberate: a false upgrade costs a few cents, a false
+ * downgrade costs answer quality on work that needed the bigger model.
+ */
+export function detectExplicitRequest(prompt: string): ExplicitRequest | null {
+  const sigil = prompt.match(SIGNALS.sigil);
+  if (sigil) {
+    const tier = { opus: 'heavy', sonnet: 'medium', haiku: 'light' }[
+      sigil[1].toLowerCase()
+    ] as TaskComplexity;
+    return { tier, via: 'sigil' };
+  }
+  // Downgrades are checked first so "use haiku, not opus" resolves to the
+  // explicitly named cheap tier rather than the incidentally named heavy one.
+  if (SIGNALS.requestLight.test(prompt))
+    return { tier: 'light', via: 'request-light' };
+  if (SIGNALS.requestMedium.test(prompt))
+    return { tier: 'medium', via: 'request-medium' };
+  if (SIGNALS.requestHeavy.test(prompt))
+    return { tier: 'heavy', via: 'request-opus' };
+  if (SIGNALS.requestThink.test(prompt))
+    return { tier: 'heavy', via: 'request-thinking' };
+  if (SIGNALS.requestImportant.test(prompt))
+    return { tier: 'heavy', via: 'request-important' };
+  return null;
+}
+
+/**
+ * Compute every prompt-derived routing signal in one place.
+ * Callers supply only the non-prompt context (group, scheduled flag, ...).
+ */
+export function detectSignals(
+  prompt: string,
+): Pick<
+  RoutingContext,
+  | 'promptLength'
+  | 'hasCodeContext'
+  | 'isFormation'
+  | 'estimatedToolCalls'
+  | 'hasLegalContext'
+  | 'hasDeepWorkContext'
+  | 'explicitRequest'
+> {
+  return {
+    promptLength: prompt.length,
+    hasCodeContext: SIGNALS.hasCodeContext.test(prompt),
+    isFormation: SIGNALS.isFormation.test(prompt),
+    estimatedToolCalls: (prompt.match(SIGNALS.toolVerbs) || []).length,
+    hasLegalContext: SIGNALS.hasLegalContext.test(prompt),
+    hasDeepWorkContext: SIGNALS.hasDeepWorkContext.test(prompt),
+    explicitRequest: detectExplicitRequest(prompt),
+  };
+}
+
+// ============================================================================
 // Rule Evaluation
 // ============================================================================
 
@@ -181,6 +306,10 @@ function evaluateCondition(condition: string, ctx: RoutingContext): boolean {
   if (c === 'isFormation') return !!ctx.isFormation;
   if (c === 'hasCodeContext') return ctx.hasCodeContext;
   if (c === '!hasCodeContext') return !ctx.hasCodeContext;
+  if (c === 'hasLegalContext') return !!ctx.hasLegalContext;
+  if (c === '!hasLegalContext') return !ctx.hasLegalContext;
+  if (c === 'hasDeepWorkContext') return !!ctx.hasDeepWorkContext;
+  if (c === '!hasDeepWorkContext') return !ctx.hasDeepWorkContext;
 
   // Compound conditions with &&
   if (c.includes('&&')) {
@@ -256,34 +385,41 @@ export function selectModel(ctx: RoutingContext): RoutingDecision {
     };
   }
 
-  // Pinned main groups default to the medium (Sonnet 5) model; escalate to Opus on demand.
-  if (config.pinnedGroups.includes(ctx.groupFolder)) {
+  // An explicit request in the message text beats all automatic logic, in
+  // both directions. This is the on-demand control surface: "use Opus",
+  // "think harder", "!opus" escalate; "!haiku", "use sonnet" step down.
+  // Deliberately placed above the pinned-group floor so an explicit downgrade
+  // is honoured rather than silently clamped back up to medium.
+  if (ctx.explicitRequest) {
+    const { tier, via } = ctx.explicitRequest;
     return {
-      model: config.models.medium,
-      complexity: 'medium',
-      reason: 'pinned-sonnet5-default',
+      model: config.models[tier],
+      complexity: tier,
+      reason: `explicit-${via}`,
     };
   }
 
-  // Evaluate config-driven rules in order
+  // Evaluate config-driven rules in order (first match wins)
+  let complexity: TaskComplexity = config.defaultComplexity;
+  let reason = 'default';
   for (const rule of config.rules) {
     if (evaluateCondition(rule.condition, ctx)) {
-      const complexity = rule.complexity as TaskComplexity;
-      return {
-        model: config.models[complexity],
-        complexity,
-        reason: rule.reason,
-      };
+      complexity = rule.complexity as TaskComplexity;
+      reason = rule.reason;
+      break;
     }
   }
 
-  // Default
-  const defaultComplexity = config.defaultComplexity;
-  return {
-    model: config.models[defaultComplexity],
-    complexity: defaultComplexity,
-    reason: 'default',
-  };
+  // Pinned main groups (Lucas's live WhatsApp/Telegram chats) apply a cost
+  // FLOOR, not an override: never silently drop to Haiku, but let the rules
+  // above escalate to Opus. Prior behaviour hard-returned medium here, which
+  // meant the rules array never ran for these two groups at all.
+  if (config.pinnedGroups.includes(ctx.groupFolder) && complexity === 'light') {
+    complexity = 'medium';
+    reason = 'pinned-floor-medium';
+  }
+
+  return { model: config.models[complexity], complexity, reason };
 }
 
 // ============================================================================

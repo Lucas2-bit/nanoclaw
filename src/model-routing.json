@@ -1,10 +1,11 @@
 {
   "models": {
-    "heavy": "claude-opus-4-8",
+    "heavy": "claude-opus-5",
     "medium": "claude-sonnet-5",
     "light": "claude-haiku-4-5-20251001"
   },
   "pricing": {
+    "claude-opus-5":             { "input": 5.0,   "output": 25.0,  "cache_write": 6.25,  "cache_read": 0.50 },
     "claude-opus-4-8":           { "input": 5.0,   "output": 25.0,  "cache_write": 6.25,  "cache_read": 0.50 },
     "claude-opus-4-7":           { "input": 5.0,   "output": 25.0,  "cache_write": 6.25,  "cache_read": 0.50 },
     "claude-opus-4-6":           { "input": 15.0,  "output": 75.0,  "cache_write": 18.75, "cache_read": 1.50 },
@@ -17,7 +18,19 @@
     "telegram_main",
     "whatsapp_main"
   ],
+  "signalPatterns": {
+    "sigil": "(?:^|\\s)!(opus|sonnet|haiku)\\b",
+    "requestHeavy": "\\b(?:use|using|used|with|via|run|running|switch(?:ed|ing)?|escalate|escalating|route|bump|upgrade|need(?:s|ed)?|require[sd]?|want(?:s|ed)?|put|do)\\b[^.!?\\n]{0,24}?\\bopus\\b",
+    "requestThink": "\\b(?:ultra-?think|think(?:ing)? (?:harder|deeper|deeply|carefully)|deep(?:er)? (?:thinking|analysis|dive)|heavy thinking|extended thinking|max(?:imum)? thinking|really think|take your time)\\b",
+    "requestImportant": "\\b(?:this|that|it)(?:'s| is| one is)? (?:really |very |extremely |super )?important\\b",
+    "requestMedium": "\\b(?:use|with|on|switch to)\\s+(?:claude\\s+)?sonnet\\b",
+    "requestLight": "\\b(?:use|with|on|switch to)\\s+(?:claude\\s+)?haiku\\b",
+    "hasLegalContext": "\\b(?:grievance|lawsuit|attorney|lawyer|litigation|arbitration|deposition|subpoena|non-disclosure|NDA|indemnif|breach of contract|(?:IP|intellectual property) assignment|(?:harassment|discrimination) claim|severance (?:agreement|package)|legal (?:advice|opinion|review)|contract review|review(?:ing)? (?:the |this |a |some |these |those )?(?:contract|agreement)s?)",
+    "hasDeepWorkContext": "\\b(?:adversarial review|root[- ]cause|postmortem|post[- ]mortem|threat model|security (?:review|audit)|architect(?:ure|ing)|design doc|trade[- ]?offs?\\b.{0,20}\\banalys|migration plan|capacity plan|failure mode|risk assessment|due diligence)"
+  },
   "rules": [
+    { "condition": "hasLegalContext", "complexity": "heavy", "reason": "legal-or-contract-review" },
+    { "condition": "hasDeepWorkContext", "complexity": "heavy", "reason": "deep-analytical-work" },
     { "condition": "isFormation", "complexity": "heavy", "reason": "formation" },
     { "condition": "estimatedToolCalls > 5", "complexity": "heavy", "reason": "multi-tool-task" },
     { "condition": "promptLength > 50000 && hasCodeContext", "complexity": "heavy", "reason": "long-code-context" },

@@ -34,6 +34,7 @@ import { RegisteredGroup } from './types.js';
 import {
   selectModel,
   buildRoutingLog,
+  detectSignals,
   type RoutingContext,
 } from './model-selector.js';
 import { logRoutingDecision } from './provider-router.js';
@@ -406,20 +407,14 @@ export async function runContainerAgent(
   // Dynamic model selection: use explicit model if set, otherwise route by task complexity
   let effectiveModel = input.model;
   if (!effectiveModel) {
+    // All prompt-derived signals (code/legal/deep-work context, tool-call
+    // estimate, and any explicit "use Opus"/"!haiku" request) are computed by
+    // detectSignals so the patterns live next to the routing config that can
+    // override them, rather than being duplicated here.
     const routingCtx: RoutingContext = {
-      promptLength: input.prompt.length,
-      hasCodeContext:
-        /\b(file|code|function|class|import|error|bug|src\/|\.ts|\.js|\.py)\b/i.test(
-          input.prompt,
-        ),
+      ...detectSignals(input.prompt),
       isScheduledTask: !!input.isScheduledTask,
       groupFolder: input.groupFolder,
-      isFormation: /\b(form|formation|parago)\b/i.test(input.prompt),
-      estimatedToolCalls: (
-        input.prompt.match(
-          /\b(read|search|grep|find|check|look at|review)\b/gi,
-        ) || []
-      ).length,
     };
     const decision = selectModel(routingCtx);
     effectiveModel = decision.model;
