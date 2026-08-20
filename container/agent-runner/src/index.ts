@@ -488,14 +488,18 @@ async function runQuery(
             },
             alwaysLoad: true,
           },
+          // Installed globally in the image (see container/Dockerfile) and
+          // invoked by binary name — NOT via `npx -y`, which re-downloaded the
+          // package on every container start and blew past the MCP handshake
+          // timeout, causing intermittent "Gmail not connecting" failures.
           gmail: {
-            command: 'npx',
-            args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
+            command: 'gmail-mcp',
+            args: [],
             alwaysLoad: true,
           },
           calendar: {
-            command: 'npx',
-            args: ['-y', '@gongrzhe/server-calendar-autoauth-mcp'],
+            command: 'server-calendar-autoauth-mcp',
+            args: [],
             alwaysLoad: true,
           },
           'mac-host-bridge': {

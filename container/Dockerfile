@@ -32,7 +32,20 @@ ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Install agent-browser and claude-code globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code
+#
+# The Gmail and Calendar MCP servers are installed here too, rather than being
+# fetched with `npx -y ...` at container start. Containers run with --rm and no
+# persistent npm cache, so npx re-downloaded these packages (plus dependencies)
+# on EVERY spawn — measured at >40s, which is far longer than the MCP client
+# waits for a stdio server to complete its handshake. The result was Gmail and
+# Calendar tools intermittently failing to connect with no useful error.
+# Baking them in makes startup instant and offline-safe. Versions are pinned so
+# a registry change can't silently alter behaviour mid-deploy.
+RUN npm install -g \
+    agent-browser \
+    @anthropic-ai/claude-code \
+    @gongrzhe/server-gmail-autoauth-mcp@1.1.11 \
+    @gongrzhe/server-calendar-autoauth-mcp@1.0.2
 
 # Create app directory
 WORKDIR /app
