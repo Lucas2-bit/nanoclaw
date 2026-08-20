@@ -1,0 +1,114 @@
+from __future__ import annotations
+import subprocess
+import mac_host_bridge.config as config
+
+
+def _launchctl_print(label: str) -> dict:
+    uid = config.LUCAS_UID
+    if not uid:
+        return {"error": "LUCAS_UID not set — bridge startup incomplete"}
+
+    result = subprocess.run(
+        ["launchctl", "print", f"gui/{uid}/{label}"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+
+
+def _parse_launchctl_state(output: str) -> tuple[str, int | None, int | None]:
+    """Parse launchctl print output. Returns (state, pid, last_exit_code)."""
+    state = "unknown"
+    pid = None
+    last_exit = None
+
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("state ="):
+            val = line.split("=", 1)[1].strip()
+            if "running" in val:
+                state = "running"
+            elif "not running" in val:
+                state = "stopped"
+            else:
+                state = val
+        elif line.startswith("pid ="):
+            try:
+                pid = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("last exit code ="):
+            try:
+                last_exit = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+
+    return state, pid, last_exit
+
+
+def get_service_status(service_name: config.ApprovedService) -> dict:
+    label = config.LAUNCHD_LABELS[service_name.value]
+    raw = _launchctl_print(label)
+
+    if "error" in raw:
+        return raw
+
+    if raw["returncode"] != 0:
+        if "Could not find service" in raw["stderr"] or "No such process" in raw["stderr"]:
+            return {
+                "service": service_name.value,
+                "state": "not_loaded",
+                "pid": None,
+                "last_exit_code": None,
+            }
+        return {
+            "service": service_name.value,
+            "state": "unknown",
+            "error": raw["stderr"].strip(),
+        }
+
+    state, pid, last_exit = _parse_launchctl_state(raw["stdout"])
+    return {
+        "service": service_name.value,
+        "state": state,
+        "pid": pid,
+        "last_exit_code": last_exit,
+    }
+
+
+def restart_service(service_name: config.ApprovedService, confirm: bool) -> dict:
+    label = config.LAUNCHD_LABELS[service_name.value]
+    uid = config.LUCAS_UID
+
+    if not uid:
+        return {"error": "LUCAS_UID not set — bridge startup incomplete"}
+
+    if not confirm:
+        return {
+            "action": "dry_run",
+            "description": f"Would run: launchctl kickstart -k gui/{uid}/{label}",
+            "service": service_name.value,
+            "to_execute": "set confirm=true to proceed",
+        }
+
+    result = subprocess.run(
+        ["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    if result.returncode == 0:
+        return {
+            "action": "restart_issued",
+            "service": service_name.value,
+            "message": "Restart command accepted. Call get_service_status in ~5s to confirm.",
+            "launchctl_output": result.stdout.strip(),
+        }
+    else:
+        return {
+            "action": "failed",
+            "service": service_name.value,
+            "error": result.stderr.strip() or result.stdout.strip(),
+        }
