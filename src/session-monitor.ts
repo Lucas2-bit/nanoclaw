@@ -71,6 +71,125 @@ function writeAlertFile(message: string): void {
 const HARD_CEILING_BYTES = 1 * 1024 * 1024; // 1 MB
 
 /**
+ * Size at which we stop deferring and forcibly abort the in-flight run.
+ *
+ * HARD_CEILING is only enforceable when no run is active. A run may hold the
+ * folder for up to QUEUE_HARD_TIMEOUT (90 min) or, for scheduled tasks,
+ * TASK_HARD_TIMEOUT (270 min), and the defer response is identical regardless
+ * of size — so a session can grow far past the "hard" ceiling that is supposed
+ * to stop it. Measured on this host: sessions reached 3770 KB while deferring,
+ * and 141 of 1515 archived sessions had breached 1 MB (largest 17300 KB).
+ *
+ * At this size the agent is at or past its usable context window and its
+ * output is already degraded, so reclaiming the context is worth more than the
+ * in-flight reply — which is requeued rather than lost (see
+ * GroupQueue.abortActiveRun).
+ *
+ * Default is 2x HARD_CEILING: one doubling of headroom, so a run that crosses
+ * 1 MB and finishes normally is never disturbed, while the observed 3.1-3.7 MB
+ * cases are caught. Env-overridable so it can be retuned without a rebuild.
+ */
+const ABORT_CEILING_BYTES = parseInt(
+  process.env.SESSION_ABORT_CEILING_BYTES || String(2 * 1024 * 1024),
+  10,
+);
+
+/**
+ * Aborting is throttled: `docker stop -t 1` plus teardown is not instant and
+ * the monitor ticks every 60s, so an unthrottled abort would re-fire while the
+ * previous kill is still settling. And if a single run inherently produces more
+ * than ABORT_CEILING of output, abort -> fresh session -> regrow -> abort would
+ * thrash. After ABORT_MAX_PER_HOUR we stop killing and escalate to a human
+ * instead: a visible alert beats an invisible kill loop.
+ */
+const ABORT_COOLDOWN_MS = 5 * 60 * 1000;
+const ABORT_MAX_PER_HOUR = 3;
+const lastAbortAt = new Map<string, number>();
+const abortHistory = new Map<string, number[]>();
+
+/**
+ * Whether an abort is permitted for this folder right now (cooldown + hourly
+ * cap). Exported for testing; callers pass the result into
+ * decideSessionAction so the decision itself stays pure.
+ */
+export function isAbortAllowed(groupFolder: string, now = Date.now()): boolean {
+  const last = lastAbortAt.get(groupFolder);
+  if (last !== undefined && now - last < ABORT_COOLDOWN_MS) return false;
+  const recent = (abortHistory.get(groupFolder) || []).filter(
+    (t) => now - t < 60 * 60 * 1000,
+  );
+  abortHistory.set(groupFolder, recent);
+  return recent.length < ABORT_MAX_PER_HOUR;
+}
+
+/**
+ * Record that an abort was issued, for cooldown/cap accounting.
+ * Exported so the throttle logic can be tested directly — it is the part most
+ * likely to carry an off-by-one, and a wrong cap here means either an
+ * invisible kill loop or a ceiling that never enforces.
+ */
+export function recordAbort(groupFolder: string, now = Date.now()): void {
+  lastAbortAt.set(groupFolder, now);
+  const recent = (abortHistory.get(groupFolder) || []).filter(
+    (t) => now - t < 60 * 60 * 1000,
+  );
+  recent.push(now);
+  abortHistory.set(groupFolder, recent);
+}
+
+/** Reset abort throttling state. Test-only. */
+export function __resetAbortState(): void {
+  lastAbortAt.clear();
+  abortHistory.clear();
+}
+
+/** What the monitor should do about one session file. */
+export type SessionAction =
+  | { kind: 'none' }
+  | { kind: 'warn' }
+  | { kind: 'archive'; reason: 'stale' | 'critical' | 'hard' }
+  | { kind: 'defer'; reason: 'critical' | 'hard' }
+  | { kind: 'abort' };
+
+/**
+ * Decide what to do about a session file. Pure: no fs, no db, no clock, no
+ * logging — the caller supplies every input and executes the result.
+ *
+ * Threshold order is highest-first. `abort` only applies when a run is
+ * in-flight; when idle, an oversized session is simply archived, because the
+ * normal path already works and there is nothing to kill.
+ */
+export function decideSessionAction(args: {
+  sizeBytes: number;
+  mtimeMs: number;
+  now: number;
+  inFlight: boolean;
+  abortAllowed: boolean;
+}): SessionAction {
+  const { sizeBytes, mtimeMs, now, inFlight, abortAllowed } = args;
+
+  if (sizeBytes >= ABORT_CEILING_BYTES && inFlight) {
+    // Throttled out: fall back to the ordinary defer rather than killing.
+    return abortAllowed ? { kind: 'abort' } : { kind: 'defer', reason: 'hard' };
+  }
+  if (sizeBytes >= HARD_CEILING_BYTES) {
+    return inFlight
+      ? { kind: 'defer', reason: 'hard' }
+      : { kind: 'archive', reason: 'hard' };
+  }
+  if (sizeBytes >= CRITICAL_THRESHOLD_BYTES) {
+    return inFlight
+      ? { kind: 'defer', reason: 'critical' }
+      : { kind: 'archive', reason: 'critical' };
+  }
+  if (sizeBytes >= WARN_THRESHOLD_BYTES) {
+    const isStale = now - mtimeMs > STALE_SESSION_HOURS * 3600 * 1000;
+    return isStale ? { kind: 'archive', reason: 'stale' } : { kind: 'warn' };
+  }
+  return { kind: 'none' };
+}
+
+/**
  * Archive a session file by moving it to an archive directory.
  * This is a hard reset - the session is gone, next agent run starts fresh.
  * Returns true if the archive succeeded.
@@ -117,23 +236,37 @@ export type SessionResetCallback = (groupFolder: string) => void;
 export type InFlightCheck = (groupFolder: string) => boolean;
 
 /**
- * Check session file sizes for all registered groups.
- * Logs a warning when a session file exceeds WARN_THRESHOLD_BYTES.
- * When CRITICAL_THRESHOLD_BYTES is exceeded: logs an error, writes an alert
- * file, and invokes onCompact (if provided and cooldown has elapsed) to
- * automatically inject /compact into the group.
+ * Callback invoked when a session has grown past ABORT_CEILING_BYTES while a
+ * container run is still in-flight. The implementation is expected to kill that
+ * run (requeueing the user's message so the reply is regenerated, not lost).
+ * The archive itself happens on a LATER tick, once the run has cleared.
+ */
+export type AbortRunCallback = (groupFolder: string, reason: string) => void;
+
+/**
+ * Check session file sizes for all registered groups and act on each.
  *
- * Returns the number of groups whose active session files exceeded the
- * critical threshold.
+ * The decision is made by decideSessionAction (pure, unit-tested); this
+ * function is the IO shell that gathers inputs and executes the result.
+ *
+ * Returns the number of groups whose session files were at or past the
+ * critical threshold and required a destructive action.
+ *
+ * NOTE: `onCompact` is accepted for signature compatibility but is not invoked.
+ * Auto-compact was removed from the CRITICAL path deliberately ("compaction at
+ * this size causes API timeouts") and the parameter is now vestigial.
  */
 export function checkSessionFileSizes(
   registeredGroups: Record<string, RegisteredGroup>,
   onCompact?: CompactTrigger,
   onSessionReset?: SessionResetCallback,
   isFolderInFlight?: InFlightCheck,
+  onAbortRun?: AbortRunCallback,
 ): number {
+  void onCompact; // vestigial — see note above
   const sessions = getAllSessions();
   let criticalCount = 0;
+  const now = Date.now();
 
   for (const [, group] of Object.entries(registeredGroups)) {
     const sessionId = sessions[group.folder];
@@ -143,40 +276,97 @@ export function checkSessionFileSizes(
     const filePath = path.join(dir, `${sessionId}.jsonl`);
 
     let stat: fs.Stats;
-    let sizeBytes: number;
     try {
       stat = fs.statSync(filePath);
-      sizeBytes = stat.size;
     } catch {
       // File doesn't exist yet — not an error
       continue;
     }
 
+    const sizeBytes = stat.size;
     const sizeKB = Math.round(sizeBytes / 1024);
+    const inFlight = isFolderInFlight?.(group.folder) ?? false;
+    const action = decideSessionAction({
+      sizeBytes,
+      mtimeMs: stat.mtimeMs,
+      now,
+      inFlight,
+      abortAllowed: isAbortAllowed(group.folder, now),
+    });
 
-    if (sizeBytes >= HARD_CEILING_BYTES) {
-      // HARD CEILING: archive the file and nuke the session.
-      // Don't try to compact - that requires loading the bloated file.
-      if (isFolderInFlight?.(group.folder)) {
+    const meta = { groupFolder: group.folder, sessionId, sizeKB };
+
+    switch (action.kind) {
+      case 'none':
+        break;
+
+      case 'warn':
+        logger.warn(meta, 'session-monitor: session file approaching size limit');
+        break;
+
+      case 'defer':
         logger.warn(
-          { groupFolder: group.folder, sessionId, sizeKB },
+          meta,
           'session-monitor: reset deferred — run in-flight, will retry next tick',
         );
-        continue;
-      }
-      criticalCount++;
-      const msg =
-        `HARD CEILING: Session file for group "${group.folder}" is ${sizeKB} KB ` +
-        `(limit: ${HARD_CEILING_BYTES / 1024} KB). Archiving and resetting.`;
-      logger.error(
-        { groupFolder: group.folder, sessionId, sizeKB },
-        'session-monitor: HARD CEILING hit — archiving session',
-      );
-      writeAlertFile(msg);
+        break;
 
-      if (archiveAndResetSession(group.folder, sessionId)) {
-        // Notify the main process to clear in-memory session state
-        if (onSessionReset) {
+      case 'abort': {
+        criticalCount++;
+        const reason =
+          `session ${sizeKB} KB exceeded abort ceiling ` +
+          `(${Math.round(ABORT_CEILING_BYTES / 1024)} KB) with a run in-flight`;
+        logger.error(
+          meta,
+          'session-monitor: ABORT CEILING hit — killing in-flight run so the session can be reset',
+        );
+        writeAlertFile(
+          `ABORT CEILING: ${reason} for group "${group.folder}". ` +
+            `Killing the run; the message is requeued and the session will be ` +
+            `archived on the next tick.`,
+        );
+        recordAbort(group.folder, now);
+        if (onAbortRun) {
+          try {
+            onAbortRun(group.folder, reason);
+          } catch (err) {
+            logger.error(
+              { err, groupFolder: group.folder },
+              'session-monitor: onAbortRun callback failed',
+            );
+          }
+        } else {
+          logger.warn(
+            meta,
+            'session-monitor: abort ceiling hit but no onAbortRun wired — cannot reclaim',
+          );
+        }
+        break;
+      }
+
+      case 'archive': {
+        if (action.reason === 'stale') {
+          logger.info(
+            meta,
+            'session-monitor: archiving stale session (warn zone + stale)',
+          );
+        } else {
+          criticalCount++;
+          const label = action.reason === 'hard' ? 'HARD CEILING' : 'CRITICAL';
+          const limitKB =
+            action.reason === 'hard'
+              ? HARD_CEILING_BYTES / 1024
+              : CRITICAL_THRESHOLD_BYTES / 1024;
+          logger.error(
+            meta,
+            `session-monitor: ${label} hit — archiving session`,
+          );
+          writeAlertFile(
+            `${label}: Session file for group "${group.folder}" is ${sizeKB} KB ` +
+              `(limit: ${limitKB} KB). Archiving and resetting.`,
+          );
+        }
+        if (archiveAndResetSession(group.folder, sessionId) && onSessionReset) {
           try {
             onSessionReset(group.folder);
           } catch (err) {
@@ -186,63 +376,7 @@ export function checkSessionFileSizes(
             );
           }
         }
-      }
-    } else if (sizeBytes >= CRITICAL_THRESHOLD_BYTES) {
-      // Archive immediately — compaction at this size causes API timeouts.
-      if (isFolderInFlight?.(group.folder)) {
-        logger.warn(
-          { groupFolder: group.folder, sessionId, sizeKB },
-          'session-monitor: reset deferred — run in-flight, will retry next tick',
-        );
-        continue;
-      }
-      criticalCount++;
-      const msg =
-        `CRITICAL: Session file for group "${group.folder}" is ${sizeKB} KB ` +
-        `(threshold: ${CRITICAL_THRESHOLD_BYTES / 1024} KB). Archiving and resetting.`;
-      logger.error(
-        { groupFolder: group.folder, sessionId, sizeKB },
-        'session-monitor: CRITICAL threshold hit — archiving session',
-      );
-      writeAlertFile(msg);
-
-      if (archiveAndResetSession(group.folder, sessionId)) {
-        if (onSessionReset) {
-          try {
-            onSessionReset(group.folder);
-          } catch (err) {
-            logger.warn(
-              { err, groupFolder: group.folder },
-              'session-monitor: onSessionReset callback failed',
-            );
-          }
-        }
-      }
-    } else if (sizeBytes >= WARN_THRESHOLD_BYTES) {
-      const isStale =
-        Date.now() - stat.mtimeMs > STALE_SESSION_HOURS * 3600 * 1000;
-      if (isStale) {
-        logger.info(
-          { groupFolder: group.folder, sessionId, sizeKB },
-          'session-monitor: archiving stale session (warn zone + stale)',
-        );
-        if (archiveAndResetSession(group.folder, sessionId)) {
-          if (onSessionReset) {
-            try {
-              onSessionReset(group.folder);
-            } catch (err) {
-              logger.warn(
-                { err, groupFolder: group.folder },
-                'session-monitor: onSessionReset callback failed',
-              );
-            }
-          }
-        }
-      } else {
-        logger.warn(
-          { groupFolder: group.folder, sessionId, sizeKB },
-          'session-monitor: session file approaching size limit',
-        );
+        break;
       }
     }
   }
@@ -288,14 +422,16 @@ export function startSessionMonitor(
   onCompact?: CompactTrigger,
   onSessionReset?: SessionResetCallback,
   isFolderInFlight?: InFlightCheck,
+  onAbortRun?: AbortRunCallback,
 ): void {
   logger.info(
     {
       warnThresholdKB: WARN_THRESHOLD_BYTES / 1024,
       criticalThresholdKB: CRITICAL_THRESHOLD_BYTES / 1024,
       hardCeilingKB: HARD_CEILING_BYTES / 1024,
+      abortCeilingKB: ABORT_CEILING_BYTES / 1024,
+      abortWired: !!onAbortRun,
       intervalMs: CHECK_INTERVAL_MS,
-      autoCompact: !!onCompact,
     },
     'session-monitor: started',
   );

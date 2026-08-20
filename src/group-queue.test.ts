@@ -26,6 +26,12 @@ vi.mock('fs', async () => {
   };
 });
 
+// stopContainer would shell out to docker; spy on it instead so the abort path
+// can be asserted without a container runtime.
+vi.mock('./container-runtime.js', () => ({
+  stopContainer: vi.fn(),
+}));
+
 describe('GroupQueue', () => {
   let queue: GroupQueue;
 
@@ -520,4 +526,81 @@ describe('GroupQueue', () => {
     // Run finished — back to inactive (finally clears state.active)
     expect(queue.isActive('group1@g.us')).toBe(false);
   });
+
+  // --- abortActiveRun (session abort ceiling) ---
+
+  describe('abortActiveRun', () => {
+    it('returns false and does nothing when the group is idle', () => {
+      const requeue = vi.fn();
+      queue.setRequeueFn(requeue);
+      expect(queue.abortActiveRun('idle@g.us', 'test')).toBe(false);
+      expect(requeue).not.toHaveBeenCalled();
+    });
+
+    it('requeues a message run with the PRE-increment generation', async () => {
+      const requeue = vi.fn();
+      queue.setRequeueFn(requeue);
+
+      let release!: () => void;
+      queue.setProcessMessagesFn(async () => {
+        await new Promise<void>((r) => (release = r));
+        return { ok: true, ranToCompletion: true };
+      });
+
+      queue.enqueueMessageCheck('g1@g.us');
+      await vi.advanceTimersByTimeAsync(10);
+
+      const genBefore = queue.getGeneration('g1@g.us');
+      expect(queue.abortActiveRun('g1@g.us', 'oversized')).toBe(true);
+
+      // requeueFn must receive the generation the dying invocation ran under,
+      // not the incremented one — RISK-013 chunk 5a dedup depends on this.
+      expect(requeue).toHaveBeenCalledTimes(1);
+      expect(requeue).toHaveBeenCalledWith('g1@g.us', genBefore);
+      expect(queue.getGeneration('g1@g.us')).toBe(genBefore + 1);
+
+      release();
+      await vi.advanceTimersByTimeAsync(10);
+    });
+
+    it('does not requeue a task run', async () => {
+      const requeue = vi.fn();
+      queue.setRequeueFn(requeue);
+
+      let release!: () => void;
+      queue.enqueueTask('t1@g.us', 'task-1', async () => {
+        await new Promise<void>((r) => (release = r));
+      });
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(queue.abortActiveRun('t1@g.us', 'oversized')).toBe(true);
+      expect(requeue).not.toHaveBeenCalled();
+
+      release();
+      await vi.advanceTimersByTimeAsync(10);
+    });
+
+    it('leaves the run active — cleanup stays with the run\'s own finally', async () => {
+      queue.setRequeueFn(vi.fn());
+      let release!: () => void;
+      queue.setProcessMessagesFn(async () => {
+        await new Promise<void>((r) => (release = r));
+        return { ok: true, ranToCompletion: true };
+      });
+
+      queue.enqueueMessageCheck('g2@g.us');
+      await vi.advanceTimersByTimeAsync(10);
+      expect(queue.isActive('g2@g.us')).toBe(true);
+
+      queue.abortActiveRun('g2@g.us', 'oversized');
+      // Still active immediately after: the method must not clear state itself.
+      expect(queue.isActive('g2@g.us')).toBe(true);
+
+      release();
+      await vi.advanceTimersByTimeAsync(10);
+      // Cleared only once the run's finally ran.
+      expect(queue.isActive('g2@g.us')).toBe(false);
+    });
+  });
+
 });

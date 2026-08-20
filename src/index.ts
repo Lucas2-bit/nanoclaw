@@ -1854,6 +1854,36 @@ async function main(): Promise<void> {
       }
       return false;
     },
+    // Abort callback: the session has grown past the abort ceiling while a run
+    // still holds the folder, so deferring again would just let it keep growing.
+    // Kill the run (the message is requeued inside abortActiveRun) and let the
+    // NEXT monitor tick do the archive, once the container has finished exiting
+    // — renaming the .jsonl out from under a process still flushing to it risks
+    // a truncated archive.
+    (groupFolder: string, reason: string): void => {
+      let aborted = false;
+      for (const [jid, g] of Object.entries(registeredGroups)) {
+        if (g.folder !== groupFolder) continue;
+        if (queue.abortActiveRun(resolvePrimaryJid(jid), reason)) {
+          aborted = true;
+          break;
+        }
+      }
+      if (!aborted) {
+        logger.warn(
+          { groupFolder, reason },
+          'session-monitor abort: no active run found for folder (already cleared?)',
+        );
+      }
+      routeOpsAlert(
+        `Session abort on ${groupFolder}: ${reason}. ` +
+          (aborted
+            ? 'In-flight container killed; session archives on the next tick.'
+            : 'No active run found — nothing killed.'),
+      ).catch((err) =>
+        logger.warn({ err, groupFolder }, 'routeOpsAlert (session abort) failed'),
+      );
+    },
   );
 
   // Start channel health monitor (Fix 2 — silent disconnect detection)

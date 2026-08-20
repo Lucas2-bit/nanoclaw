@@ -366,6 +366,85 @@ export class GroupQueue {
   }
 
   /**
+   * Forcibly abort the in-flight run for a JID so an oversized session can be
+   * reclaimed. Called by session-monitor at ABORT_CEILING_BYTES, where the
+   * agent's context is already past usable size.
+   *
+   * Returns false (and does nothing) when no run is active.
+   *
+   * Why this is NOT just handleHangTimeout:
+   *
+   * An external kill does not take the timeout branch. stopContainer runs
+   * `docker stop -t 1`; the container exits, container-runner's
+   * `container.on('close')` RESOLVES the run promise, and withHardTimeout
+   * therefore returns 'done' (or 'error' if output parsing throws). Both of
+   * those downstream paths already call scheduleRetry (`ok === false` and the
+   * catch block) but NEITHER calls requeueFn. So:
+   *
+   *   - we must NOT call scheduleRetry here — that would double-schedule
+   *   - we MUST call requeueFn here, or the in-flight user message is silently
+   *     dropped and never answered
+   *
+   * The requeue happens BEFORE the kill and uses the same
+   * capture-then-increment ordering as the timeout branch, so the RISK-013
+   * chunk 5a (jid, generation) dedup slot still resolves to the dying
+   * invocation rather than the retry that replaces it.
+   *
+   * Like handleHangTimeout, this does not touch state.active / activeCount /
+   * the folder lock — the run's own `finally` remains the single cleanup site.
+   */
+  abortActiveRun(groupJid: string, reason: string): boolean {
+    const state = this.groups.get(groupJid);
+    if (!state?.active) return false;
+
+    const isTask = state.isTaskContainer === true;
+    logger.error(
+      {
+        groupJid,
+        containerName: state.containerName,
+        label: isTask ? 'task' : 'message',
+        reason,
+      },
+      'Abort requested: killing in-flight container to reclaim session',
+    );
+
+    if (!isTask) {
+      // Message runs requeue so the reply is regenerated against the fresh
+      // session. Task runs do not — matching the existing task timeout branch.
+      const priorGeneration = state.generation;
+      state.generation++;
+      this.requeueFn?.(groupJid, priorGeneration);
+    }
+
+    if (state.containerName) {
+      try {
+        stopContainer(state.containerName);
+      } catch {
+        try {
+          state.process?.kill('SIGKILL');
+        } catch {
+          /* already dead */
+        }
+      }
+    } else {
+      try {
+        state.process?.kill('SIGKILL');
+      } catch {
+        /* already dead */
+      }
+    }
+
+    if (this.notifyMainFn) {
+      this.notifyMainFn(
+        `Session abort on ${groupJid}: ${reason}. Container killed${isTask ? '' : ', message requeued'}; session will be archived on the next monitor tick.`,
+      ).catch((err) =>
+        logger.warn({ err, groupJid }, 'notifyMainFn (session abort) failed'),
+      );
+    }
+    return true;
+  }
+
+  /**
    * Set a function that resolves a JID to its group folder name.
    * Enables folder-level locking: if two JIDs share the same folder,
    * only one container runs at a time for that folder.
