@@ -39,3 +39,7 @@ agents-sdk-docs
 backups/
 .bridge-backups/
 scripts/applied/
+
+# Python bytecode (mac-host-bridge)
+__pycache__/
+*.pyc
