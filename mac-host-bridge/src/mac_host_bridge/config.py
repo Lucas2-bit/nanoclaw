@@ -6,12 +6,24 @@ class ApprovedService(str, Enum):
     mcp_bridge = "mcp-bridge"
     ollama = "ollama"
 
-# This process runs as root (it is a LaunchDaemon with no UserName key), so
-# os.path.expanduser("~") resolves to /var/root — NOT Lucas's home directory.
-# Any user-scoped path must be anchored to this constant instead. Using "~"
-# here silently produced paths that do not exist, which is indistinguishable
-# from "the service is broken" in tool output — see the ollama note below.
-# Overridable via env so this is not hardcoded for a single machine.
+# Do NOT use os.path.expanduser("~") for user-scoped paths here.
+#
+# This process is a LaunchDaemon with no UserName key, so it runs as root (uid
+# 0). expanduser() resolves "~" from $HOME when that is set, and otherwise from
+# the running uid's passwd entry. Which one applies depends on HOW the daemon
+# was started:
+#
+#   * kickstarted from a logged-in user's session -> HOME may be inherited,
+#     and "~" happens to resolve to /Users/lucascarroll (observed 2026-08-20)
+#   * started at boot via RunAtLoad, or with a clean environment -> no HOME,
+#     so "~" resolves to root's home, /var/root
+#
+# So the same code silently produces different paths depending on start method,
+# and the boot path is the one that breaks. A path that does not exist makes
+# get_logs return empty, which is indistinguishable from "the service is dead"
+# in tool output — see the ollama note below, and the 9h outage note further
+# down. Anchor user paths to this constant instead. Env-overridable rather than
+# hardcoded so this is not tied to one machine.
 LUCAS_HOME: str = os.environ.get("MCP_BRIDGE_USER_HOME") or "/Users/lucascarroll"
 
 # Live sink for nanoclaw stdout is pm2's per-process out-log, NOT

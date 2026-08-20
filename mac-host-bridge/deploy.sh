@@ -38,8 +38,16 @@ from mac_host_bridge.server import mcp
 echo "    compiles and imports cleanly"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-echo "==> Backing up live tree to ${LIVE_SRC}.bak-${STAMP}"
-sudo cp -R "$LIVE_SRC" "${LIVE_SRC}.bak-${STAMP}"
+# Backups go OUTSIDE the import path. Writing them next to mac_host_bridge/
+# would put full copies inside /opt/mcp-bridge/src, which is the daemon's
+# PYTHONPATH — harmless today only because "mac_host_bridge.bak-<stamp>" is not
+# a legal module name. Not worth relying on, and it accumulates a whole tree
+# per deploy inside the directory Python scans.
+BACKUP_ROOT="/opt/mcp-bridge/backups"
+BACKUP_DIR="${BACKUP_ROOT}/mac_host_bridge-${STAMP}"
+echo "==> Backing up live tree to ${BACKUP_DIR}"
+sudo mkdir -p "$BACKUP_ROOT"
+sudo cp -R "$LIVE_SRC" "$BACKUP_DIR"
 
 echo "==> Mirroring repo -> live"
 sudo rsync -a --delete \
@@ -59,12 +67,12 @@ for _ in $(seq 1 30); do
     echo "    bridge is up and answering MCP"
     echo
     echo "Deployed. Roll back with:"
-    echo "  sudo rsync -a --delete ${LIVE_SRC}.bak-${STAMP}/ $LIVE_SRC/ && sudo launchctl kickstart -k $LABEL"
+    echo "  sudo rsync -a --delete ${BACKUP_DIR}/ $LIVE_SRC/ && sudo launchctl kickstart -k $LABEL"
     exit 0
   fi
   sleep 1
 done
 
 echo "FAIL: bridge did not answer within 30s. Roll back with:"
-echo "  sudo rsync -a --delete ${LIVE_SRC}.bak-${STAMP}/ $LIVE_SRC/ && sudo launchctl kickstart -k $LABEL"
+echo "  sudo rsync -a --delete ${BACKUP_DIR}/ $LIVE_SRC/ && sudo launchctl kickstart -k $LABEL"
 exit 1
