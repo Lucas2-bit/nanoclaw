@@ -43,3 +43,4 @@ scripts/applied/
 # Python bytecode (mac-host-bridge)
 __pycache__/
 *.pyc
+*.bak
