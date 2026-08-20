@@ -580,7 +580,7 @@ describe('GroupQueue', () => {
       await vi.advanceTimersByTimeAsync(10);
     });
 
-    it('leaves the run active — cleanup stays with the run\'s own finally', async () => {
+    it("leaves the run active — cleanup stays with the run's own finally", async () => {
       queue.setRequeueFn(vi.fn());
       let release!: () => void;
       queue.setProcessMessagesFn(async () => {
@@ -602,5 +602,4 @@ describe('GroupQueue', () => {
       expect(queue.isActive('g2@g.us')).toBe(false);
     });
   });
-
 });

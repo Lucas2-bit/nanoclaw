@@ -21,7 +21,11 @@ const STALE = NOW - 25 * 3600 * 1000; // >24h old
 
 const decide = (
   sizeBytes: number,
-  opts: Partial<{ inFlight: boolean; abortAllowed: boolean; mtimeMs: number }> = {},
+  opts: Partial<{
+    inFlight: boolean;
+    abortAllowed: boolean;
+    mtimeMs: number;
+  }> = {},
 ) =>
   decideSessionAction({
     sizeBytes,
@@ -126,9 +130,7 @@ describe('decideSessionAction', () => {
       };
       const sizes = [0, WARN, CRITICAL, HARD, ABORT, 8192 * KB];
       for (const inFlight of [false, true]) {
-        const seen = sizes.map(
-          (s) => severity[decide(s, { inFlight }).kind],
-        );
+        const seen = sizes.map((s) => severity[decide(s, { inFlight }).kind]);
         for (let i = 1; i < seen.length; i++) {
           expect(seen[i]).toBeGreaterThanOrEqual(seen[i - 1]);
         }

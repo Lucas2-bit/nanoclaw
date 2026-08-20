@@ -1881,7 +1881,10 @@ async function main(): Promise<void> {
             ? 'In-flight container killed; session archives on the next tick.'
             : 'No active run found — nothing killed.'),
       ).catch((err) =>
-        logger.warn({ err, groupFolder }, 'routeOpsAlert (session abort) failed'),
+        logger.warn(
+          { err, groupFolder },
+          'routeOpsAlert (session abort) failed',
+        ),
       );
     },
   );

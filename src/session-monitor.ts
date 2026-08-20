@@ -301,7 +301,10 @@ export function checkSessionFileSizes(
         break;
 
       case 'warn':
-        logger.warn(meta, 'session-monitor: session file approaching size limit');
+        logger.warn(
+          meta,
+          'session-monitor: session file approaching size limit',
+        );
         break;
 
       case 'defer':
