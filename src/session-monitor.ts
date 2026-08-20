@@ -143,10 +143,104 @@ export function __resetAbortState(): void {
   abortHistory.clear();
 }
 
+/**
+ * Size at which a silent /compact is injected.
+ *
+ * Deliberately well below CRITICAL. Auto-compact used to run AT critical, and
+ * on 2026-04-29 that was replaced with archive because "compaction at this size
+ * causes API timeouts" — which removed the only non-destructive step in the
+ * ladder and left warn -> archive -> archive -> abort. Compacting early is the
+ * way to get a working compaction step back.
+ *
+ * 300 KB has empirical support: archived sessions show compaction SUCCEEDING
+ * with 531 KB and 570 KB of pre-boundary content, so this sits comfortably
+ * below anything observed failing.
+ */
+const COMPACT_THRESHOLD_BYTES = parseInt(
+  process.env.SESSION_COMPACT_THRESHOLD_BYTES || String(WARN_THRESHOLD_BYTES),
+  10,
+);
+
+/**
+ * Bytes after the last compact_boundary — the session's *effective* context.
+ *
+ * The .jsonl is an append-only transcript: once a compaction happens, prior
+ * history is summarised and only the records after the boundary are live. Raw
+ * file size therefore overstates context badly once a session has compacted.
+ * Measured on archived sessions: 7200 KB total with 21 KB after the boundary,
+ * 5440 KB -> 14 KB, 2075 KB -> 60 KB. Judging those by total size would archive
+ * or abort perfectly healthy sessions.
+ *
+ * Falls back to total size when the session has never been compacted, so
+ * never-compacted sessions behave exactly as before.
+ *
+ * Cached by (size, mtimeMs) so an unchanged file is scanned at most once.
+ */
+const effectiveCache = new Map<
+  string,
+  { size: number; mtimeMs: number; effective: number }
+>();
+
+/** Don't scan pathologically large transcripts; fall back to total size. */
+const MAX_EFFECTIVE_SCAN_BYTES = 64 * 1024 * 1024;
+
+export function effectiveSessionBytes(
+  filePath: string,
+  size: number,
+  mtimeMs: number,
+): number {
+  const hit = effectiveCache.get(filePath);
+  if (hit && hit.size === size && hit.mtimeMs === mtimeMs) return hit.effective;
+
+  let effective = size;
+  if (size <= MAX_EFFECTIVE_SCAN_BYTES) {
+    try {
+      const raw = fs.readFileSync(filePath, 'utf-8');
+      const idx = raw.lastIndexOf('compact_boundary');
+      if (idx >= 0) {
+        // Start of the line the boundary record sits on.
+        const lineStart = raw.lastIndexOf('\n', idx) + 1;
+        effective = Buffer.byteLength(raw.slice(lineStart), 'utf-8');
+      }
+    } catch {
+      // Unreadable — fall back to total size rather than skipping the check.
+      effective = size;
+    }
+  }
+
+  effectiveCache.set(filePath, { size, mtimeMs, effective });
+  return effective;
+}
+
+/** Reset the effective-size cache. Test-only. */
+export function __resetEffectiveCache(): void {
+  effectiveCache.clear();
+}
+
+/** Whether a /compact injection is permitted for this folder right now. */
+export function isCompactAllowed(
+  groupFolder: string,
+  now = Date.now(),
+): boolean {
+  const last = lastCompactAt.get(groupFolder);
+  return last === undefined || now - last >= COMPACT_COOLDOWN_MS;
+}
+
+/** Record that a /compact was injected, for cooldown accounting. */
+export function recordCompact(groupFolder: string, now = Date.now()): void {
+  lastCompactAt.set(groupFolder, now);
+}
+
+/** Reset compact cooldown state. Test-only. */
+export function __resetCompactState(): void {
+  lastCompactAt.clear();
+}
+
 /** What the monitor should do about one session file. */
 export type SessionAction =
   | { kind: 'none' }
   | { kind: 'warn' }
+  | { kind: 'compact' }
   | { kind: 'archive'; reason: 'stale' | 'critical' | 'hard' }
   | { kind: 'defer'; reason: 'critical' | 'hard' }
   | { kind: 'abort' };
@@ -160,31 +254,52 @@ export type SessionAction =
  * normal path already works and there is nothing to kill.
  */
 export function decideSessionAction(args: {
-  sizeBytes: number;
+  /**
+   * Bytes of LIVE context — i.e. after the last compact_boundary, not total
+   * transcript length. See effectiveSessionBytes. Judging by total size
+   * archives and aborts sessions that have already compacted and are healthy.
+   */
+  effectiveBytes: number;
   mtimeMs: number;
   now: number;
   inFlight: boolean;
   abortAllowed: boolean;
+  compactAllowed: boolean;
 }): SessionAction {
-  const { sizeBytes, mtimeMs, now, inFlight, abortAllowed } = args;
+  const {
+    effectiveBytes,
+    mtimeMs,
+    now,
+    inFlight,
+    abortAllowed,
+    compactAllowed,
+  } = args;
 
-  if (sizeBytes >= ABORT_CEILING_BYTES && inFlight) {
+  if (effectiveBytes >= ABORT_CEILING_BYTES && inFlight) {
     // Throttled out: fall back to the ordinary defer rather than killing.
     return abortAllowed ? { kind: 'abort' } : { kind: 'defer', reason: 'hard' };
   }
-  if (sizeBytes >= HARD_CEILING_BYTES) {
+  if (effectiveBytes >= HARD_CEILING_BYTES) {
     return inFlight
       ? { kind: 'defer', reason: 'hard' }
       : { kind: 'archive', reason: 'hard' };
   }
-  if (sizeBytes >= CRITICAL_THRESHOLD_BYTES) {
+  if (effectiveBytes >= CRITICAL_THRESHOLD_BYTES) {
     return inFlight
       ? { kind: 'defer', reason: 'critical' }
       : { kind: 'archive', reason: 'critical' };
   }
-  if (sizeBytes >= WARN_THRESHOLD_BYTES) {
+  if (effectiveBytes >= WARN_THRESHOLD_BYTES) {
+    // Stale wins over compact: nobody is using this session, so summarising it
+    // is pointless — archive it as before.
     const isStale = now - mtimeMs > STALE_SESSION_HOURS * 3600 * 1000;
-    return isStale ? { kind: 'archive', reason: 'stale' } : { kind: 'warn' };
+    if (isStale) return { kind: 'archive', reason: 'stale' };
+    // The non-destructive step: shrink the live context while preserving
+    // continuity, so the session never reaches the archiving thresholds above.
+    if (effectiveBytes >= COMPACT_THRESHOLD_BYTES && compactAllowed) {
+      return { kind: 'compact' };
+    }
+    return { kind: 'warn' };
   }
   return { kind: 'none' };
 }
@@ -252,9 +367,10 @@ export type AbortRunCallback = (groupFolder: string, reason: string) => void;
  * Returns the number of groups whose session files were at or past the
  * critical threshold and required a destructive action.
  *
- * NOTE: `onCompact` is accepted for signature compatibility but is not invoked.
- * Auto-compact was removed from the CRITICAL path deliberately ("compaction at
- * this size causes API timeouts") and the parameter is now vestigial.
+ * `onCompact` injects a silent /compact once the LIVE context (not raw
+ * transcript size) passes COMPACT_THRESHOLD_BYTES. This is the only
+ * non-destructive step in the ladder; without it a bloating session is only
+ * ever archived, losing all continuity.
  */
 export function checkSessionFileSizes(
   registeredGroups: Record<string, RegisteredGroup>,
@@ -263,7 +379,6 @@ export function checkSessionFileSizes(
   isFolderInFlight?: InFlightCheck,
   onAbortRun?: AbortRunCallback,
 ): number {
-  void onCompact; // vestigial — see note above
   const sessions = getAllSessions();
   let criticalCount = 0;
   const now = Date.now();
@@ -285,16 +400,31 @@ export function checkSessionFileSizes(
 
     const sizeBytes = stat.size;
     const sizeKB = Math.round(sizeBytes / 1024);
+    // Only scan for a compact boundary once the transcript is large enough to
+    // matter — small sessions cost nothing beyond the statSync above.
+    const effectiveBytes =
+      sizeBytes >= WARN_THRESHOLD_BYTES
+        ? effectiveSessionBytes(filePath, sizeBytes, stat.mtimeMs)
+        : sizeBytes;
+    const effectiveKB = Math.round(effectiveBytes / 1024);
     const inFlight = isFolderInFlight?.(group.folder) ?? false;
     const action = decideSessionAction({
-      sizeBytes,
+      effectiveBytes,
       mtimeMs: stat.mtimeMs,
       now,
       inFlight,
       abortAllowed: isAbortAllowed(group.folder, now),
+      compactAllowed: isCompactAllowed(group.folder, now),
     });
 
-    const meta = { groupFolder: group.folder, sessionId, sizeKB };
+    // Both sizes are logged: effective drives the decision, total explains why
+    // a multi-MB file may legitimately need no action.
+    const meta = {
+      groupFolder: group.folder,
+      sessionId,
+      sizeKB,
+      effectiveKB,
+    };
 
     switch (action.kind) {
       case 'none':
@@ -313,6 +443,32 @@ export function checkSessionFileSizes(
           'session-monitor: reset deferred — run in-flight, will retry next tick',
         );
         break;
+
+      case 'compact': {
+        if (!onCompact) {
+          logger.warn(
+            meta,
+            'session-monitor: compact threshold reached but no onCompact wired',
+          );
+          break;
+        }
+        // Record before invoking: if the injection throws we still respect the
+        // cooldown rather than retrying every 60s.
+        recordCompact(group.folder, now);
+        logger.info(
+          meta,
+          'session-monitor: compact threshold reached — injecting silent /compact',
+        );
+        try {
+          onCompact(group.folder);
+        } catch (err) {
+          logger.warn(
+            { err, groupFolder: group.folder },
+            'session-monitor: auto-compact trigger failed',
+          );
+        }
+        break;
+      }
 
       case 'abort': {
         criticalCount++;
@@ -430,9 +586,14 @@ export function startSessionMonitor(
   logger.info(
     {
       warnThresholdKB: WARN_THRESHOLD_BYTES / 1024,
+      compactThresholdKB: COMPACT_THRESHOLD_BYTES / 1024,
       criticalThresholdKB: CRITICAL_THRESHOLD_BYTES / 1024,
       hardCeilingKB: HARD_CEILING_BYTES / 1024,
       abortCeilingKB: ABORT_CEILING_BYTES / 1024,
+      // Thresholds are measured against LIVE context (bytes since the last
+      // compact_boundary), not raw transcript size.
+      metric: 'effective-bytes',
+      autoCompactWired: !!onCompact,
       abortWired: !!onAbortRun,
       intervalMs: CHECK_INTERVAL_MS,
     },
