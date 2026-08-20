@@ -177,12 +177,24 @@ def main():
     if not config.LUCAS_UID:
         print("WARNING: Could not resolve user UID. Service status/restart tools will fail.")
 
-    # Fix log paths that used ~ at import time (expanded to /var/root when running as daemon)
+    # Re-anchor USER-SCOPED log paths to the real user's home. Necessary because
+    # "~" expands at import time against $HOME, which for this daemon depends on
+    # how launchd started it (/var/root at boot, inherited otherwise). Resolving
+    # from LUCAS_UID via pwd is authoritative.
+    #
+    # Only paths that genuinely live under the user's home belong here. ollama
+    # was previously forced to {home}/.ollama/logs/server.log, which exists on
+    # no machine: Homebrew's ollama service writes to
+    # /opt/homebrew/var/log/ollama.log per its own plist
+    # (homebrew.mxcl.ollama -> StandardOut/ErrorPath). That override silently
+    # clobbered the correct absolute path from config.APPROVED_LOG_PATHS, so
+    # get_logs("ollama") always returned "Log file does not exist yet" — which
+    # reads as "ollama is down" rather than "this path is wrong". Left out
+    # deliberately; do not re-add it.
     if config.LUCAS_UID:
         home = _resolve_user_home(config.LUCAS_UID)
         if home:
             config.APPROVED_LOG_PATHS["nanoclaw"] = f"{home}/.pm2/logs/nanoclaw-out.log"
-            config.APPROVED_LOG_PATHS["ollama"] = f"{home}/.ollama/logs/server.log"
             config.FALLBACK_LOG_DIR = f"{home}/nanoclaw/logs"
 
     print(f"mac-host-bridge v{config.VERSION} starting on {host}:{port}")
