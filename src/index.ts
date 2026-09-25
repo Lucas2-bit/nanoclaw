@@ -107,7 +107,7 @@ import {
 } from './dead-letter-worker.js';
 import { setOwnerPush } from './safety/outbound-guard.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { getSessionFileSize, startSessionMonitor } from './session-monitor.js';
+import { getEffectiveSessionSize, startSessionMonitor } from './session-monitor.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { parseImageReferences } from './image.js';
 import { generateSpeech } from './tts.js';
@@ -1111,12 +1111,12 @@ async function runAgent(
   // Pre-flight: if session file is near the critical threshold, inject
   // /compact instead of the user prompt to prevent OOM during the run.
   const PRE_FLIGHT_THRESHOLD = 2.5 * 1024 * 1024; // 2.5 MB — triggers before the 3 MB critical
-  const sessionSize = getSessionFileSize(group.folder, sessionId);
+  const sessionSize = getEffectiveSessionSize(group.folder, sessionId);
   if (sessionSize > PRE_FLIGHT_THRESHOLD) {
     logger.warn(
       {
         groupFolder: group.folder,
-        sessionSizeKB: Math.round(sessionSize / 1024),
+        effectiveSizeKB: Math.round(sessionSize / 1024),
       },
       'runAgent: session file near limit — injecting /compact before user prompt',
     );

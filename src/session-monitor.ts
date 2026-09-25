@@ -576,6 +576,29 @@ export function getSessionFileSize(
   }
 }
 
+/**
+ * Pre-flight check against *effective* context — bytes since the last
+ * compact_boundary — rather than raw file size.
+ *
+ * The .jsonl is append-only, so raw size never shrinks after a compaction.
+ * Comparing raw size to the pre-flight threshold therefore latches on
+ * permanently once a session has ever been large, re-injecting /compact on
+ * every subsequent message. Returns 0 if no active session file exists.
+ */
+export function getEffectiveSessionSize(
+  groupFolder: string,
+  sessionId: string | undefined,
+): number {
+  if (!sessionId) return 0;
+  const filePath = path.join(sessionDir(groupFolder), `${sessionId}.jsonl`);
+  try {
+    const st = fs.statSync(filePath);
+    return effectiveSessionBytes(filePath, st.size, st.mtimeMs);
+  } catch {
+    return 0;
+  }
+}
+
 export function startSessionMonitor(
   getRegisteredGroups: () => Record<string, RegisteredGroup>,
   onCompact?: CompactTrigger,
